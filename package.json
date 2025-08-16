@@ -1,0 +1,90 @@
+{
+  "name": "ymori-sql-formatter",
+  "displayName": "ymori-sql-formatter",
+  "description": "sql formatter",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Formatters"
+  ],
+  "activationEvents": [
+    "onLanguage:sql"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "sql",
+        "extensions": [
+          ".sql"
+        ],
+        "aliases": [
+          "SQL",
+          "sql"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "ymori-sql-formatter.format",
+        "title": "format sql"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "ymori-sql-formatter.format",
+        "key": "shift+alt+f",
+        "when": "editorTextFocus && editorLangId == sql"
+      }
+    ],
+    "configuration": {
+      "title": "ymori sql formatter",
+      "properties": {
+        "ymori-sql-formatter.indentSize": {
+          "type": "number",
+          "default": 2,
+          "description": "indent size"
+        },
+        "ymori-sql-formatter.keywordCase": {
+          "type": "string",
+          "enum": [
+            "upper",
+            "lower"
+          ],
+          "default": "upper",
+          "description": "Case of Keyword"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "@types/vscode": "^1.103.0",
+    "@typescript-eslint/eslint-plugin": "^8.39.0",
+    "@typescript-eslint/parser": "^8.39.0",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.32.0",
+    "ts-loader": "^9.5.2",
+    "typescript": "^5.9.2",
+    "webpack": "^5.101.0",
+    "webpack-cli": "^6.0.1"
+  },
+  "dependencies": {
+    "node-sql-parser": "^5.3.11"
+  }
+}
