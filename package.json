@@ -68,7 +68,12 @@
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "test:formatter": "node tests/test-runner.js",
+    "test:formatter:unit": "node tests/test-runner.js --unit",
+    "test:formatter:integration": "node tests/test-runner.js --integration",
+    "test:formatter:watch": "node tests/test-runner.js --watch",
+    "test:formatter:verbose": "node tests/test-runner.js --verbose"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

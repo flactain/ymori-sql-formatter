@@ -1,725 +1,1365 @@
 import { Parser } from 'node-sql-parser';
 
-// 設定のインターフェース
+// フォーマッターオプション
 export interface FormatterOptions {
-    indentSize: number;
-    keywordCase: 'upper' | 'string';
+    indentSize?: number;
+    keywordCase?: 'upper' | 'lower';
 }
 
-// SQLフォーマッター関数
-export function formatSql(sqlText: string, options: FormatterOptions): string {
-    const parser = new Parser();
-    
-    try {
-        // SQLをASTに変換
-        const ast = parser.astify(sqlText);
-        
-        // ASTをフォーマットされたSQLに変換
-        return formatAst(ast, options, parser);
-    } catch (error) {
-        // node-sql-parserでサポートされていない構文の場合
-        if (error instanceof Error) {
-            if (error.message.includes('binary_expr statements not supported') ||
-                error.message.includes('WITH') ||
-                error.message.includes('CTE')) {
-                throw new Error(`WITH clause contains unsupported syntax. Please simplify the query or use standard SQL syntax. Original error: ${error.message}`);
-            }
-        }
-        throw new Error(`Failed to parse SQL: ${error}`);
-    }
-}
+// デフォルトオプション
+export const DEFAULT_FORMATTER_OPTIONS: Required<FormatterOptions> = {
+    indentSize: 2,
+    keywordCase: 'upper'
+};
 
-// ASTをフォーマット
-function formatAst(ast: any, options: FormatterOptions, parser: Parser): string {
-    if (Array.isArray(ast)) {
-        return ast.map(stmt => formatStatement(stmt, options, parser, 0)).join('\n\n');
-    }
-    return formatStatement(ast, options, parser, 0);
-}
+/**
+ * SQLフォーマッターのメインクラス
+ * 右揃えキーワードシステムと左揃えカラム配置を実装
+ */
+export class SqlFormatter {
+    private parser: Parser;
+    private options: Required<FormatterOptions>;
 
-// キーワード右揃え用のヘルパー関数
-function formatWithRightAlignedKeywords(parts: Array<{keyword: string, content: string}>, baseIndent: number = 0): string {
-    if (parts.length === 0) return '';
-    
-    // 最長のキーワード長を取得（空文字列のキーワードは除外）
-    const keywordsWithLength = parts.filter(part => part.keyword !== '');
-    const maxKeywordLength = keywordsWithLength.length > 0 ? Math.max(...keywordsWithLength.map((part: {keyword: string, content: string}) => part.keyword.length)) : 0;
-    const baseIndentStr = ' '.repeat(baseIndent);
-    
-    return parts.map((part: {keyword: string, content: string}) => {
-        if (part.keyword === '') {
-            // 空のキーワード（右括弧など）はインデントレベル0（左端）に配置
-            return part.content;
-        } else {
-            const paddedKeyword = part.keyword.padStart(maxKeywordLength);
-            return `${baseIndentStr}${paddedKeyword} ${part.content}`;
-        }
-    }).join('\n');
-}
+    constructor(options: FormatterOptions = {}) {
+        this.parser = new Parser();
+        this.options = { ...DEFAULT_FORMATTER_OPTIONS, ...options };
+    }
 
-// ステートメントをフォーマット
-function formatStatement(stmt: any, options: FormatterOptions, parser: Parser, depth: number): string {
-    switch (stmt.type?.toUpperCase()) {
-        case 'SELECT':
-            return formatSelectStatement(stmt, options, parser, depth);
-        
-        case 'INSERT':
-            return formatInsertStatement(stmt, options, parser, depth);
-        
-        case 'UPDATE':
-            return formatUpdateStatement(stmt, options, parser, depth);
-        
-        case 'DELETE':
-            return formatDeleteStatement(stmt, options, parser, depth);
-        
-        default:
-            // フォールバック: 基本的なSQLify
-            try {
-                return parser.sqlify(stmt, {});
-            } catch {
-                return 'UNKNOWN_STATEMENT';
-            }
-    }
-}
-
-// SELECT文のフォーマット
-function formatSelectStatement(stmt: any, options: FormatterOptions, parser: Parser, depth: number): string {
-    // WITH句とメインクエリを統合して全体でキーワード右揃え
-    const allParts: Array<{keyword: string, content: string}> = [];
-    
-    // WITH句の処理（統合バージョン）
-    if (stmt.with) {
-        const withParts = formatWithClauseIntegrated(stmt.with, options, parser, depth);
-        allParts.push(...withParts);
-    }
-    
-    // メインのSELECT部分
-    const selectKeyword = options.keywordCase === 'upper' ? 'SELECT' : 'select';
-    let selectContent = '';
-    
-    // DISTINCT
-    if (stmt.distinct) {
-        const distinctKeyword = options.keywordCase === 'upper' ? 'DISTINCT' : 'distinct';
-        selectContent += distinctKeyword + ' ';
-    }
-    
-    // カラムの整列処理
-    if (stmt.columns) {
-        const columns = stmt.columns.map((col: any) => {
-            try {
-                if (col.expr?.type === 'column_ref') {
-                    const colName = col.expr.column === '*' ? '*' : `${col.expr.table ? col.expr.table + '.' : ''}${col.expr.column}`;
-                    return col.as ? `${colName} AS ${col.as}` : colName;
-                } else if (col.expr?.type === 'aggr_func') {
-                    // 集約関数の処理
-                    const funcName = col.expr.name;
-                    const args = col.expr.args?.value || '*';
-                    const funcExpr = `${funcName}(${args})`;
-                    return col.as ? `${funcExpr} AS ${col.as}` : funcExpr;
-                }
-                const colExpr = parser.sqlify(col, {});
-                return colExpr;
-            } catch (error) {
-                // カラムの処理でエラーが発生した場合、可能な限り元の情報を保持
-                console.warn('Column formatting failed, using fallback:', error);
-                if (col.expr?.column) {
-                    return col.expr.column;
-                } else if (col.column) {
-                    return col.column;
-                } else if (typeof col === 'string') {
-                    return col;
-                } else {
-                    return '*'; // フォールバック
-                }
-            }
-        });
-        
-        // カラムが多い場合は複数行に分割（カンマ前置）
-        if (columns.length > 2) {
-            const columnIndent = ' '.repeat(selectKeyword.length + 1);
-            selectContent += '\n' + columns.map((col: string, index: number) => {
-                if (index === 0) {
-                    return columnIndent + '  ' + col;
-                } else {
-                    return columnIndent + ', ' + col;
-                }
-            }).join('\n');
-        } else {
-            selectContent += columns.join(', ');
-        }
-    }
-    
-    allParts.push({keyword: selectKeyword, content: selectContent});
-    
-    // FROM句
-    if (stmt.from) {
-        const fromKeyword = options.keywordCase === 'upper' ? 'FROM' : 'from';
-        // JOINを含まないテーブルのみをFROM句に含める
-        const fromTables = stmt.from.filter((table: any) => !table.join);
-        if (fromTables.length > 0) {
-            const fromContent = fromTables.map((table: any) => formatTableReference(table, options)).join(', ');
-            allParts.push({keyword: fromKeyword, content: fromContent});
-        }
-    }
-    
-    // JOIN句の処理
-    if (stmt.from) {
-        // JOINを含むテーブルのみを処理
-        const joinTables = stmt.from.filter((table: any) => table.join);
-        
-        joinTables.forEach((table: any) => {
-            try {
-                const joinType = table.join || 'INNER';
-                // joinTypeがすでに"JOIN"を含んでいる場合とそうでない場合を区別
-                let joinKeyword: string;
-                if (joinType.includes('JOIN')) {
-                    joinKeyword = options.keywordCase === 'upper' ? joinType.toUpperCase() : joinType.toLowerCase();
-                } else {
-                    joinKeyword = options.keywordCase === 'upper' ? `${joinType.toUpperCase()} JOIN` : `${joinType.toLowerCase()} join`;
-                }
-                
-                const joinContent = formatTableReference(table, options);
-                allParts.push({keyword: joinKeyword, content: joinContent});
-                
-                if (table.on) {
-                    try {
-                        const onKeyword = options.keywordCase === 'upper' ? 'ON' : 'on';
-                        let onContent: string;
-                        
-                        // ON句の基本的な処理
-                        if (table.on.type === 'binary_expr') {
-                            const left = `${table.on.left.table}.${table.on.left.column}`;
-                            const operator = table.on.operator;
-                            const right = `${table.on.right.table}.${table.on.right.column}`;
-                            onContent = `${left} ${operator} ${right}`;
-                        } else {
-                            onContent = parser.sqlify(table.on, {});
-                        }
-                        
-                        allParts.push({keyword: onKeyword, content: onContent});
-                    } catch (error) {
-                        console.warn('JOIN ON clause formatting failed:', error);
-                        const onKeyword = options.keywordCase === 'upper' ? 'ON' : 'on';
-                        allParts.push({keyword: onKeyword, content: '(join condition)'});
-                    }
-                }
-            } catch (error) {
-                console.warn('JOIN clause formatting failed:', error);
-            }
-        });
-    }
-    
-    // WHERE句
-    if (stmt.where) {
+    /**
+     * SQLをフォーマットする
+     */
+    formatSql(sql: string): string {
         try {
-            const whereKeyword = options.keywordCase === 'upper' ? 'WHERE' : 'where';
-            let whereContent: string;
+            // ヒント句を抽出・保存
+            const { sql: cleanSql, hint } = this.extractHintComment(sql);
             
-            // WHERE句の基本的な処理を試行
-            if (stmt.where.type === 'binary_expr') {
-                const left = stmt.where.left?.column || stmt.where.left?.value || 'unknown';
-                const operator = stmt.where.operator || '=';
-                const right = stmt.where.right?.value || stmt.where.right?.column || 'unknown';
-                whereContent = `${left} ${operator} ${typeof right === 'string' ? `'${right}'` : right}`;
-            } else {
-                whereContent = parser.sqlify(stmt.where, {});
+            // PostgreSQL用でパース
+            const ast = this.parser.astify(cleanSql, { database: 'Postgresql' });
+            
+            // ASTが配列でない場合（UNION文など）は配列に変換
+            const statements = Array.isArray(ast) ? ast : [ast];
+            
+            if (statements.length === 0) {
+                throw new Error('No valid SQL statements found');
             }
-            
-            allParts.push({keyword: whereKeyword, content: whereContent});
-        } catch (error) {
-            console.warn('WHERE clause formatting failed, trying simple approach:', error);
-            // より基本的なアプローチ
-            try {
-                const whereKeyword = options.keywordCase === 'upper' ? 'WHERE' : 'where';
-                if (stmt.where.left && stmt.where.operator && stmt.where.right) {
-                    const whereContent = `${stmt.where.left.column || stmt.where.left.value} ${stmt.where.operator} ${stmt.where.right.value || stmt.where.right.column}`;
-                    allParts.push({keyword: whereKeyword, content: whereContent});
-                }
-            } catch (fallbackError) {
-                console.warn('WHERE clause complete formatting failed:', fallbackError);
-            }
-        }
-    }
-    
-    // GROUP BY句
-    if (stmt.groupby) {
-        try {
-            const groupByKeyword = options.keywordCase === 'upper' ? 'GROUP BY' : 'group by';
-            let groupByContent: string;
-            
-            if (Array.isArray(stmt.groupby)) {
-                groupByContent = stmt.groupby.map((col: any) => {
-                    try {
-                        if (col.type === 'column_ref') {
-                            return col.column;
-                        }
-                        // より安全なアプローチ: parser.sqlifyを使わずに直接処理
-                        if (col.column) {
-                            return col.column;
-                        } else if (col.expr?.column) {
-                            return col.expr.column;
-                        } else {
-                            return 'user_id'; // フォールバック
-                        }
-                    } catch (error) {
-                        console.warn('GROUP BY column formatting failed:', error);
-                        return col.column || col.expr?.column || 'user_id';
-                    }
-                }).join(', ');
-            } else {
-                // 単一のGROUP BY項目
-                try {
-                    if (stmt.groupby.type === 'column_ref') {
-                        groupByContent = stmt.groupby.column;
-                    } else if (stmt.groupby.column) {
-                        groupByContent = stmt.groupby.column;
-                    } else if (stmt.groupby.expr?.column) {
-                        groupByContent = stmt.groupby.expr.column;
-                    } else {
-                        // parser.sqlifyを使わずに、推測で処理
-                        groupByContent = 'user_id'; // 一般的なケース
-                    }
-                } catch (error) {
-                    console.warn('Single GROUP BY column formatting failed:', error);
-                    groupByContent = 'user_id'; // より具体的なフォールバック
-                }
-            }
-            
-            allParts.push({keyword: groupByKeyword, content: groupByContent});
-        } catch (error) {
-            console.warn('GROUP BY clause formatting failed completely:', error);
-            // 完全にエラーが発生した場合でも、推測でGROUP BY句を追加
-            const groupByKeyword = options.keywordCase === 'upper' ? 'GROUP BY' : 'group by';
-            allParts.push({keyword: groupByKeyword, content: 'user_id'});
-        }
-    }
-    
-    // HAVING句
-    if (stmt.having) {
-        try {
-            const havingKeyword = options.keywordCase === 'upper' ? 'HAVING' : 'having';
-            let havingContent: string;
-            
-            // HAVING句の処理をより安全に
-            try {
-                havingContent = parser.sqlify(stmt.having, {});
-                allParts.push({keyword: havingKeyword, content: havingContent});
-            } catch (sqlifyError) {
-                // parser.sqlifyが失敗した場合の手動処理
-                if (stmt.having.type === 'binary_expr') {
-                    const left = stmt.having.left?.column || stmt.having.left?.name;
-                    const operator = stmt.having.operator;
-                    const right = stmt.having.right?.value || stmt.having.right?.column;
-                    
-                    // leftが関数名だけの場合、括弧を追加
-                    let leftFormatted = left;
-                    if (left && (left === 'COUNT' || left === 'SUM' || left === 'AVG' || left === 'MAX' || left === 'MIN')) {
-                        leftFormatted = `${left}(*)`;
-                    }
-                    
-                    if (leftFormatted && operator && right !== undefined) {
-                        havingContent = `${leftFormatted} ${operator} ${right}`;
-                        allParts.push({keyword: havingKeyword, content: havingContent});
-                    } else {
-                        console.warn('HAVING clause incomplete');
-                        allParts.push({keyword: havingKeyword, content: '/* 解析できませんでした */'});
-                    }
-                } else {
-                    console.warn('HAVING clause unsupported type');
-                    allParts.push({keyword: havingKeyword, content: '/* 解析できませんでした */'});
-                }
-            }
-        } catch (error) {
-            console.warn('HAVING clause formatting failed:', error);
-            const havingKeyword = options.keywordCase === 'upper' ? 'HAVING' : 'having';
-            allParts.push({keyword: havingKeyword, content: '/* 解析できませんでした */'});
-        }
-    }
-    
-    // ORDER BY句
-    if (stmt.orderby) {
-        try {
-            const orderByKeyword = options.keywordCase === 'upper' ? 'ORDER BY' : 'order by';
-            let orderByContent: string;
-            
-            console.log('ORDER BY debug:', stmt.orderby); // デバッグ用
-            
-            if (Array.isArray(stmt.orderby)) {
-                orderByContent = stmt.orderby.map((col: any) => {
-                    try {
-                        let colName = '';
-                        let direction = '';
-                        
-                        // typeがDESCまたはASCの場合
-                        if (col.type === 'DESC' || col.type === 'ASC') {
-                            if (col.expr && col.expr.type === 'column_ref') {
-                                colName = col.expr.column;
-                                direction = ` ${col.type}`;
-                            }
-                        }
-                        // カラム名の取得（従来の方法）
-                        else if (col.type === 'column_ref') {
-                            colName = col.column;
-                        } else if (col.expr && col.expr.type === 'column_ref') {
-                            colName = col.expr.column;
-                        } else if (col.column) {
-                            colName = col.column;
-                        } else {
-                            colName = 'unknown_column';
-                        }
-                        
-                        // 方向の取得（従来の方法）
-                        if (!direction && col.order) {
-                            direction = ` ${col.order.toUpperCase()}`;
-                        }
-                        
-                        return colName + direction;
-                    } catch (error) {
-                        console.warn('ORDER BY column formatting failed:', error);
-                        return 'unknown_column';
-                    }
-                }).join(', ');
-            } else {
-                // 単一のORDER BY項目
-                try {
-                    let colName = '';
-                    let direction = '';
-                    
-                    // typeがDESCまたはASCの場合
-                    if (stmt.orderby.type === 'DESC' || stmt.orderby.type === 'ASC') {
-                        if (stmt.orderby.expr && stmt.orderby.expr.type === 'column_ref') {
-                            colName = stmt.orderby.expr.column;
-                            direction = ` ${stmt.orderby.type}`;
-                        }
-                    }
-                    // カラム名の取得（従来の方法）
-                    else if (stmt.orderby.type === 'column_ref') {
-                        colName = stmt.orderby.column;
-                    } else if (stmt.orderby.expr && stmt.orderby.expr.type === 'column_ref') {
-                        colName = stmt.orderby.expr.column;
-                    } else if (stmt.orderby.column) {
-                        colName = stmt.orderby.column;
-                    }
-                    
-                    // 方向の取得（従来の方法）
-                    if (!direction && stmt.orderby.order) {
-                        direction = ` ${stmt.orderby.order.toUpperCase()}`;
-                    }
-                    
-                    orderByContent = colName + direction;
-                    
-                    // フォールバック：parser.sqlifyを試す
-                    if (!colName) {
-                        try {
-                            orderByContent = parser.sqlify(stmt.orderby, {});
-                        } catch (sqlifyError) {
-                            orderByContent = 'unknown_column';
-                        }
-                    }
-                } catch (error) {
-                    console.warn('Single ORDER BY column formatting failed:', error);
-                    orderByContent = 'unknown_column';
-                }
-            }
-            
-            allParts.push({keyword: orderByKeyword, content: orderByContent});
-        } catch (error) {
-            console.warn('ORDER BY clause formatting failed:', error);
-        }
-    }
-    
-    // LIMIT句
-    if (stmt.limit) {
-        try {
-            const limitKeyword = options.keywordCase === 'upper' ? 'LIMIT' : 'limit';
-            let limitContent: string | null = null;
-            
-            // LIMIT句の処理 - より詳細に
-            console.log('LIMIT debug:', stmt.limit); // デバッグ用
-            
-            if (typeof stmt.limit === 'number') {
-                limitContent = stmt.limit.toString();
-            } else if (typeof stmt.limit === 'string') {
-                limitContent = stmt.limit;
-            } else if (stmt.limit && typeof stmt.limit === 'object') {
-                // デバッグ情報に基づく処理: {seperator: '', value: Array(1)}
-                if (stmt.limit.value && Array.isArray(stmt.limit.value) && stmt.limit.value.length > 0) {
-                    const limitValue = stmt.limit.value[0];
-                    if (limitValue && limitValue.type === 'number' && limitValue.value !== undefined) {
-                        limitContent = limitValue.value.toString();
-                    }
-                } else if (stmt.limit.type === 'number' && stmt.limit.value !== undefined) {
-                    limitContent = stmt.limit.value.toString();
-                } else if (stmt.limit.value !== undefined) {
-                    limitContent = stmt.limit.value.toString();
-                } else {
-                    // オブジェクトの場合、parser.sqlifyを試す
-                    try {
-                        limitContent = parser.sqlify(stmt.limit, {});
-                    } catch (sqlifyError) {
-                        console.warn('LIMIT sqlify failed:', sqlifyError);
-                        limitContent = '/* 解析できませんでした */';
-                    }
-                }
-            }
-            
-            if (limitContent !== null) {
-                allParts.push({keyword: limitKeyword, content: limitContent});
-            } else {
-                console.warn('LIMIT clause could not be processed');
-                allParts.push({keyword: limitKeyword, content: '/* 解析できませんでした */'});
-            }
-        } catch (error) {
-            console.warn('LIMIT clause formatting failed:', error);
-            const limitKeyword = options.keywordCase === 'upper' ? 'LIMIT' : 'limit';
-            allParts.push({keyword: limitKeyword, content: '/* 解析できませんでした */'});
-        }
-    }
-    
-    return formatWithRightAlignedKeywords(allParts, depth * options.indentSize);
-}
 
-// WITH句を統合的にフォーマット（メインクエリのキーワードと統一）
-function formatWithClauseIntegrated(withClause: any, options: FormatterOptions, parser: Parser, depth: number): Array<{keyword: string, content: string}> {
-    const allParts: Array<{keyword: string, content: string}> = [];
-    
-    try {
-        if (Array.isArray(withClause)) {
-            withClause.forEach((cte: any, index: number) => {
-                const cteName = cte.name?.value || cte.name;
-                
-                // 最初のCTEは"WITH"（レベル0）、それ以降は","（レベル0）
-                if (index === 0) {
-                    const withKeyword = options.keywordCase === 'upper' ? 'WITH' : 'with';
-                    allParts.push({keyword: '', content: `${withKeyword} ${cteName} AS (`});
-                } else {
-                    allParts.push({keyword: '', content: `, ${cteName} AS (`});
-                }
-                
-                // CTE内のクエリの各キーワードを抽出
-                try {
-                    const cteParts = extractStatementParts(cte.stmt?.ast || cte.stmt, options, parser);
-                    allParts.push(...cteParts);
-                } catch (error) {
-                    console.warn('CTE statement parsing failed:', error);
-                    allParts.push({keyword: 'SELECT', content: '/* complex query */'});
-                }
-                
-                // 右括弧はインデントレベル0（左端）に配置
-                allParts.push({keyword: '', content: ')'});
-            });
-        } else {
-            // 単一のCTE
-            const cteName = withClause.name?.value || withClause.name;
-            const withKeyword = options.keywordCase === 'upper' ? 'WITH' : 'with';
-            allParts.push({keyword: '', content: `${withKeyword} ${cteName} AS (`});
-            
-            try {
-                const cteParts = extractStatementParts(withClause.stmt?.ast || withClause.stmt, options, parser);
-                allParts.push(...cteParts);
-            } catch (error) {
-                console.warn('Single CTE statement parsing failed:', error);
-                allParts.push({keyword: 'SELECT', content: '/* complex query */'});
-            }
-            
-            // 右括弧はインデントレベル0（左端）に配置
-            allParts.push({keyword: '', content: ')'});
-        }
-    } catch (error) {
-        console.warn('WITH clause integration failed:', error);
-        const withKeyword = options.keywordCase === 'upper' ? 'WITH' : 'with';
-        allParts.push({keyword: '', content: `${withKeyword} /* complex WITH clause */`});
-    }
-    
-    return allParts;
-}
+            // 各文をフォーマット
+            const formattedStatements = statements.map(stmt => this.formatStatement(stmt));
+            let result = formattedStatements.join('\n\n');
 
-// ステートメントからキーワード部分を抽出（CTE用）
-function extractStatementParts(stmt: any, options: FormatterOptions, parser: Parser): Array<{keyword: string, content: string}> {
-    const parts: Array<{keyword: string, content: string}> = [];
-    
-    if (stmt.type?.toUpperCase() === 'SELECT') {
+            // ヒント句を復元
+            if (hint) {
+                result = this.restoreHintComment(result, hint);
+            }
+
+            // セミコロンを追加
+            if (!result.endsWith(';')) {
+                result += ';';
+            }
+
+            return result;
+
+        } catch (error) {
+            console.error('SQL formatting failed:', error);
+            // エラー時は元のSQLを返す
+            return sql;
+        }
+    }
+
+    /**
+     * ヒント句を抽出
+     */
+    private extractHintComment(sql: string): { sql: string; hint: string | null } {
+        const hintMatch = sql.match(/^(\s*)(\w+)(\s*)(\/\*.*?\*\/)(.*)$/s);
+        if (hintMatch) {
+            const [, leading, keyword, space, hint, rest] = hintMatch;
+            return {
+                sql: leading + keyword + space + rest,
+                hint: hint
+            };
+        }
+        return { sql, hint: null };
+    }
+
+    /**
+     * ヒント句を復元
+     */
+    private restoreHintComment(sql: string, hint: string): string {
+        const firstKeywordMatch = sql.match(/^(\s*)(\w+)(\s+)/);
+        if (firstKeywordMatch) {
+            const [, leading, keyword, space] = firstKeywordMatch;
+            return sql.replace(firstKeywordMatch[0], `${leading}${keyword} ${hint}${space}`);
+        }
+        return sql;
+    }
+
+    /**
+     * 文をフォーマット
+     */
+    private formatStatement(stmt: any): string {
+        switch (stmt.type) {
+            case 'select':
+                return this.formatSelectStatement(stmt);
+            case 'insert':
+                return this.formatInsertStatement(stmt);
+            case 'replace':
+                return this.formatReplaceStatement(stmt);
+            case 'update':
+                return this.formatUpdateStatement(stmt);
+            case 'delete':
+                return this.formatDeleteStatement(stmt);
+            case 'create':
+                return this.formatCreateStatement(stmt);
+            case 'drop':
+                return this.formatDropStatement(stmt);
+            case 'alter':
+                return this.formatAlterStatement(stmt);
+            case 'truncate':
+                return this.formatTruncateStatement(stmt);
+            case 'show':
+                return this.formatShowStatement(stmt);
+            default:
+                throw new Error(`Unsupported statement type: ${stmt.type}`);
+        }
+    }
+
+    /**
+     * SELECT文をフォーマット
+     */
+    private formatSelectStatement(stmt: any): string {
+        // 最大キーワード長を計算（CTE+メインクエリ全体）
+        const maxKeywordLength = this.calculateGlobalMaxKeywordLength(stmt);
+        return this.formatSelectStatementWithKeywordLength(stmt, maxKeywordLength);
+    }
+
+    /**
+     * 指定されたmaxKeywordLengthでSELECT文をフォーマット（CTE用）
+     */
+    private formatSelectStatementWithKeywordLength(stmt: any, maxKeywordLength: number): string {
+        const parts: string[] = [];
+
+        // WITH句の処理（ネストしたCTEの場合）
+        if (stmt.with) {
+            parts.push(this.formatWithClause(stmt.with, maxKeywordLength));
+        }
+
         // SELECT句
-        const selectKeyword = options.keywordCase === 'upper' ? 'SELECT' : 'select';
-        let selectContent = '';
-        
-        if (stmt.columns) {
-            const columns = stmt.columns.map((col: any) => {
-                try {
-                    if (col.expr?.type === 'column_ref') {
-                        const colName = col.expr.column === '*' ? '*' : `${col.expr.table ? col.expr.table + '.' : ''}${col.expr.column}`;
-                        return col.as ? `${colName} AS ${col.as}` : colName;
-                    } else if (col.expr?.type === 'aggr_func') {
-                        const funcName = col.expr.name;
-                        const args = col.expr.args?.value || '*';
-                        const funcExpr = `${funcName}(${args})`;
-                        return col.as ? `${funcExpr} AS ${col.as}` : funcExpr;
-                    }
-                    return parser.sqlify(col, {});
-                } catch (error) {
-                    console.warn('CTE column formatting failed:', error);
-                    return col.expr?.column || col.column || '*';
-                }
-            });
-            selectContent = columns.join(', ');
-        }
-        
-        parts.push({keyword: selectKeyword, content: selectContent});
-        
+        parts.push(this.formatSelectClause(stmt, maxKeywordLength));
+
         // FROM句
         if (stmt.from) {
-            const fromKeyword = options.keywordCase === 'upper' ? 'FROM' : 'from';
-            const fromContent = stmt.from.map((table: any) => table.table).join(', ');
-            parts.push({keyword: fromKeyword, content: fromContent});
+            parts.push(this.formatFromClause(stmt.from, maxKeywordLength));
         }
-        
+
         // WHERE句
         if (stmt.where) {
-            const whereKeyword = options.keywordCase === 'upper' ? 'WHERE' : 'where';
-            try {
-                if (stmt.where.type === 'binary_expr') {
-                    const left = stmt.where.left?.column || stmt.where.left?.value || 'unknown';
-                    const operator = stmt.where.operator || '=';
-                    const right = stmt.where.right?.value || stmt.where.right?.column || 'unknown';
-                    const whereContent = `${left} ${operator} ${typeof right === 'string' ? `'${right}'` : right}`;
-                    parts.push({keyword: whereKeyword, content: whereContent});
-                } else {
-                    const whereContent = parser.sqlify(stmt.where, {});
-                    parts.push({keyword: whereKeyword, content: whereContent});
-                }
-            } catch (error) {
-                console.warn('CTE WHERE formatting failed:', error);
-                parts.push({keyword: whereKeyword, content: '(condition)'});
-            }
+            parts.push(this.formatWhereClause(stmt.where, maxKeywordLength));
         }
-        
+
         // GROUP BY句
         if (stmt.groupby) {
-            const groupByKeyword = options.keywordCase === 'upper' ? 'GROUP BY' : 'group by';
-            try {
-                let groupByContent: string;
-                if (Array.isArray(stmt.groupby)) {
-                    groupByContent = stmt.groupby.map((col: any) => col.column || col.expr?.column || 'user_id').join(', ');
-                } else {
-                    groupByContent = stmt.groupby.column || 'user_id';
+            parts.push(this.formatGroupByClause(stmt.groupby, maxKeywordLength));
+        }
+
+        // HAVING句
+        if (stmt.having) {
+            parts.push(this.formatHavingClause(stmt.having, maxKeywordLength));
+        }
+
+        // ORDER BY句
+        if (stmt.orderby) {
+            parts.push(this.formatOrderByClause(stmt.orderby, maxKeywordLength));
+        }
+
+        // LIMIT句（値がある場合のみ）
+        if (stmt.limit && stmt.limit.value && stmt.limit.value.length > 0) {
+            parts.push(this.formatLimitClause(stmt.limit, maxKeywordLength));
+        }
+
+        // UNION/INTERSECT/EXCEPT句の処理
+        if (stmt._next && stmt.set_op) {
+            const setOpKeyword = this.formatKeyword(stmt.set_op.toUpperCase()).padStart(maxKeywordLength, ' ');
+            parts.push(setOpKeyword);
+            parts.push(this.formatSelectStatementWithKeywordLength(stmt._next, maxKeywordLength));
+        }
+
+        return parts.join('\n');
+    }
+
+
+    /**
+     * CTE+メインクエリ全体での最大キーワード長を計算
+     */
+    private calculateGlobalMaxKeywordLength(stmt: any): number {
+        const allKeywords: string[] = [];
+
+        // CTEのキーワードを収集
+        if (stmt.with && Array.isArray(stmt.with)) {
+            allKeywords.push('WITH');
+            
+            stmt.with.forEach((cte: any) => {
+                const cteQuery = cte.stmt?.ast || cte.stmt;
+                if (cteQuery) {
+                    const cteKeywords = this.collectKeywordsFromStatement(cteQuery);
+                    allKeywords.push(...cteKeywords);
                 }
-                parts.push({keyword: groupByKeyword, content: groupByContent});
-            } catch (error) {
-                console.warn('CTE GROUP BY formatting failed:', error);
-                parts.push({keyword: groupByKeyword, content: 'user_id'});
+            });
+        }
+
+        // メインクエリのキーワードを収集
+        const mainKeywords = this.collectKeywordsFromStatement(stmt);
+        allKeywords.push(...mainKeywords);
+
+        return allKeywords.length > 0 ? Math.max(...allKeywords.map(k => k.length)) : 0;
+    }
+
+    /**
+     * 文からキーワードを収集
+     */
+    private collectKeywordsFromStatement(stmt: any): string[] {
+        const keywords: string[] = [];
+        
+        if (stmt.type === 'select') {
+            keywords.push('SELECT');
+            if (stmt.from) keywords.push('FROM');
+            if (stmt.where) keywords.push('WHERE');
+            if (stmt.groupby) keywords.push('GROUP BY');
+            if (stmt.having) keywords.push('HAVING');
+            if (stmt.orderby) keywords.push('ORDER BY');
+            if (stmt.limit) {
+                keywords.push('LIMIT');
+                // OFFSETがある場合はOFFSETキーワードも追加
+                if (stmt.limit.seperator === 'offset') {
+                    keywords.push('OFFSET');
+                }
+            }
+            
+            // JOIN句も考慮（実際のJOINタイプとON条件キーワードを収集）
+            if (stmt.from) {
+                for (const table of stmt.from) {
+                    if (table.join) {
+                        keywords.push(table.join);
+                        // ON条件があればONキーワードも追加
+                        if (table.on) {
+                            keywords.push('ON');
+                            // AND条件があれば再帰的にカウント
+                            const andCount = this.countAndKeywords(table.on);
+                            for (let i = 0; i < andCount; i++) {
+                                keywords.push('AND');
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (stmt.type === 'update') {
+            keywords.push('UPDATE');
+            if (stmt.set) keywords.push('SET');
+            if (stmt.where) keywords.push('WHERE');
+        } else if (stmt.type === 'delete') {
+            keywords.push('DELETE FROM');
+            if (stmt.where) keywords.push('WHERE');
+        } else if (stmt.type === 'insert') {
+            keywords.push('INSERT INTO');
+            if (stmt.values) keywords.push('VALUES');
+        }
+
+        return keywords;
+    }
+
+    /**
+     * 式の中のANDキーワードの数をカウント
+     */
+    private countAndKeywords(expr: any): number {
+        if (!expr) return 0;
+        
+        let count = 0;
+        if (expr.type === 'binary_expr' && expr.operator === 'AND') {
+            count = 1;
+            // 左右の式も再帰的にチェック
+            count += this.countAndKeywords(expr.left);
+            count += this.countAndKeywords(expr.right);
+        }
+        
+        return count;
+    }
+
+    /**
+     * SELECT句をフォーマット（左揃えカラム配置）
+     */
+    private formatSelectClause(stmt: any, maxKeywordLength: number): string {
+        const keyword = this.formatKeyword('SELECT');
+        
+        if (!stmt.columns || stmt.columns.length === 0) {
+            return keyword;
+        }
+
+        // カラムをフォーマット
+        const formattedColumns = stmt.columns.map((col: any) => this.formatColumn(col, maxKeywordLength));
+
+        // 単一カラムの場合
+        if (formattedColumns.length === 1) {
+            return `${keyword} ${formattedColumns[0]}`;
+        }
+
+        // 複数カラムの場合は左揃え形式
+        // SELECTキーワードも右揃えする
+        const selectKeyword = keyword.padStart(maxKeywordLength, ' ');
+        const lines = [selectKeyword];
+        
+        // カラムの開始位置を動的に計算（maxKeywordLength + 1スペース）
+        const columnIndent = ' '.repeat(maxKeywordLength + 1);
+        
+        // 最初のカラム
+        lines.push(`${columnIndent}${formattedColumns[0]}`);
+        
+        // 残りのカラム（カンマ前置き）
+        // カンマの位置は最大キーワード長から2文字引いた位置
+        const commaIndent = ' '.repeat(Math.max(0, maxKeywordLength - 1));
+        for (let i = 1; i < formattedColumns.length; i++) {
+            lines.push(`${commaIndent}, ${formattedColumns[i]}`);
+        }
+
+        return lines.join('\n');
+    }
+
+    /**
+     * カラムをフォーマット
+     */
+    private formatColumn(col: any, maxKeywordLength: number = 0): string {
+        let result = '';
+
+        // カラムの型に応じて処理
+        if (col.type === 'expr' && col.expr) {
+            result = this.formatExpression(col.expr, 0, maxKeywordLength, undefined, 'select');
+        } else if (col.expr) {
+            result = this.formatExpression(col.expr, 0, maxKeywordLength, undefined, 'select');
+        } else {
+            result = this.formatExpression(col, 0, maxKeywordLength, undefined, 'select');
+        }
+
+        // AS句を処理
+        if (col.as) {
+            result += ` AS ${col.as}`;
+        }
+
+        return result;
+    }
+
+    /**
+     * 式をフォーマット
+     */
+    private formatExpression(expr: any, depth: number = 0, maxKeywordLength?: number, contextPosition?: number, contextType?: 'select' | 'where'): string {
+        if (!expr) return '';
+
+        switch (expr.type) {
+            case 'column_ref':
+                return this.formatColumnRef(expr);
+            case 'case':
+                return this.formatCaseExpression(expr, depth, maxKeywordLength, contextPosition);
+            case 'binary_expr':
+                return this.formatBinaryExpression(expr, depth, maxKeywordLength, contextType);
+            case 'function':
+                return this.formatFunction(expr, depth, maxKeywordLength);
+            case 'aggr_func':
+                return this.formatAggregateFunction(expr, depth, maxKeywordLength);
+            case 'window_func':
+                return this.formatWindowFunction(expr, depth, maxKeywordLength);
+            case 'cast':
+                return this.formatCastExpression(expr, depth, maxKeywordLength);
+            case 'unary_expr':
+                return this.formatUnaryExpression(expr, depth, maxKeywordLength);
+            case 'array':
+                return this.formatArrayExpression(expr, depth, maxKeywordLength);
+            case 'param':
+                return this.formatParameterExpression(expr);
+            case 'backticks_quote_string':
+                return `\`${expr.value}\``;
+            case 'double_quote_string':
+                return `"${expr.value}"`;
+            case 'single_quote_string':
+                return `'${expr.value}'`;
+            case 'string':
+                return `'${expr.value}'`; // 汎用文字列
+            case 'regex_string':
+                return `~'${expr.value}'`; // PostgreSQL正規表現
+            case 'hex_string':
+                return `X'${expr.value}'`;
+            case 'bit_string':
+                return `B'${expr.value}'`;
+            case 'number':
+                return expr.value.toString();
+            case 'bool':
+            case 'boolean':
+                return expr.value.toString().toUpperCase();
+            case 'null':
+                return 'NULL';
+            case 'date':
+                return `DATE '${expr.value}'`;
+            case 'time':
+                return `TIME '${expr.value}'`;
+            case 'timestamp':
+                return `TIMESTAMP '${expr.value}'`;
+            case 'datetime':
+                return `DATETIME '${expr.value}'`;
+            case 'star':
+                return '*';
+            case 'origin':
+            case 'default':
+                return expr.value;
+            case 'expr_list':
+                if (expr.value && Array.isArray(expr.value)) {
+                    const values = expr.value.map((v: any) => {
+                        // サブクエリ（astプロパティを持つ）の場合は特別処理
+                        if (v.ast) {
+                            return this.formatSubquery(v.ast, maxKeywordLength, true);
+                        }
+                        return this.formatExpression(v, depth + 1, maxKeywordLength);
+                    }).join(', ');
+                    
+                    // サブクエリを含む場合は閉じかっこの位置を調整
+                    const hasSubquery = expr.value.some((v: any) => v.ast);
+                    if (hasSubquery && maxKeywordLength) {
+                        const closingParenIndent = ' '.repeat(maxKeywordLength+1);
+                        return `(${values}${closingParenIndent})`;
+                    }
+                    return `(${values})`;
+                }
+                return '()';
+            case 'interval':
+                const intervalValue = this.formatExpression(expr.expr, depth + 1, maxKeywordLength);
+                return `INTERVAL ${intervalValue}`;
+            case 'extract':
+                const extractField = expr.field || 'UNKNOWN';
+                const extractSource = this.formatExpression(expr.source, depth + 1, maxKeywordLength);
+                return `EXTRACT(${extractField} FROM ${extractSource})`;
+            case undefined:
+                // サブクエリの検出 (type: undefined with ast property)
+                if (expr.ast) {
+                    // WHERE句内のサブクエリ（parentheses: true）の場合は特別処理
+                    if (contextType === 'where' && expr.parentheses === true) {
+                        return this.formatSubquery(expr.ast, maxKeywordLength, false, true);
+                    }
+                    return this.formatSubquery(expr.ast, maxKeywordLength);
+                }
+                // カラムリストの検出 (type: undefined with columns property)
+                if (expr.columns && Array.isArray(expr.columns)) {
+                    return this.formatColumnList(expr.columns, depth, maxKeywordLength);
+                }
+                // その他のundefinedタイプはフォールバックへ
+                return this.handleUnknownExpression(expr, depth, maxKeywordLength);
+            default:
+                return this.handleUnknownExpression(expr, depth, maxKeywordLength);
+        }
+    }
+
+    /**
+     * サブクエリをフォーマット
+     */
+    private formatSubquery(ast: any, maxKeywordLength?: number, skipParentheses: boolean = false, isWhereContext: boolean = false): string {
+        // maxKeywordLengthが渡されている場合はそれを使用、なければ再計算
+        const subqueryResult = maxKeywordLength 
+            ? this.formatSelectStatementWithKeywordLength(ast, maxKeywordLength)
+            : this.formatSelectStatement(ast);
+        // maxKeywordLength分のオフセットを追加したインデント
+        let subqueryIndent: string;
+        if (isWhereContext) {
+            // WHERE句内のサブクエリはよりコンパクトなインデント
+            subqueryIndent = maxKeywordLength ? ' '.repeat(maxKeywordLength) : '  ';
+        } else {
+            // SELECT句内のサブクエリは従来のインデント
+            subqueryIndent = maxKeywordLength ? ' '.repeat(maxKeywordLength + 2) : '  ';
+        }
+        const indentedSubquery = subqueryResult.split('\n').map(line => 
+            line.trim() ? `${subqueryIndent}${line}` : line
+        ).join('\n');
+        
+        // skipParenthesesがtrueの場合はカッコを付けない（expr_listで既にカッコが付くため）
+        if (skipParentheses) {
+            return `\n${indentedSubquery}\n`;
+        }
+        
+        // WHERE句内サブクエリの場合はコンパクト形式
+        if (isWhereContext && maxKeywordLength) {
+            const closingParenIndent = ' '.repeat(maxKeywordLength+1);
+            // 改行を調整してコンパクトに
+            return `(${indentedSubquery.trim()}\n${closingParenIndent})`;
+        }
+        
+        // SELECT句内サブクエリなど：閉じかっこの位置をmaxKeywordLengthに合わせて調整
+        if (maxKeywordLength) {
+            const closingParenIndent = ' '.repeat(maxKeywordLength+1);
+            return `(\n${indentedSubquery}\n${closingParenIndent})`;
+        }
+        return `(\n${indentedSubquery}\n)`;
+    }
+
+    /**
+     * カラムリストをフォーマット
+     */
+    private formatColumnList(columns: any[], depth: number, maxKeywordLength?: number): string {
+        return columns.map((col: any) => this.formatExpression(col, depth + 1, maxKeywordLength)).join(', ');
+    }
+
+    /**
+     * 未知の式を処理（拡張可能な設計）
+     */
+    private handleUnknownExpression(expr: any, _depth: number = 0, _maxKeywordLength?: number): string {
+        // デバッグ用にログ出力（本番環境では無効化可能）
+        if (process.env.NODE_ENV === 'development') {
+            console.warn(`Unsupported expression type: ${expr.type}`, expr);
+        }
+        
+        // フォールバック: 元の値を返すか、プレースホルダーを返す
+        if (expr.value !== undefined) {
+            return String(expr.value);
+        }
+        
+        return '/* unsupported expression */';
+    }
+
+    /**
+     * カラム参照をフォーマット
+     */
+    private formatColumnRef(expr: any): string {
+        let columnName = '';
+        
+        // カラム名の取得（複雑な構造に対応）
+        if (typeof expr.column === 'string') {
+            columnName = expr.column;
+        } else if (expr.column && expr.column.expr && expr.column.expr.value) {
+            columnName = expr.column.expr.value;
+        } else if (expr.column && expr.column.value) {
+            columnName = expr.column.value;
+        } else {
+            columnName = 'unknown_column';
+        }
+        
+        if (expr.table) {
+            return `${expr.table}.${columnName}`;
+        }
+        return columnName;
+    }
+
+    /**
+     * CASE式をフォーマット（期待値の形式に合わせる）
+     */
+    private formatCaseExpression(expr: any, _depth: number = 0, maxKeywordLength?: number, contextPosition?: number): string {
+        const lines = [this.formatKeyword('CASE')];
+
+        // WHEN/ELSE句のインデントを動的に計算
+        let whenIndent: string;
+        let endIndent: string;
+        
+        if (contextPosition !== undefined) {
+            // WHERE句などでの位置基準インデント（演算子の後の位置基準）
+            whenIndent = ' '.repeat(contextPosition + 3);
+            endIndent = ' '.repeat(contextPosition +1);
+        } else {
+            // SELECT句などでの従来のインデント（CASEキーワードに合わせて8文字分インデント）
+            whenIndent = maxKeywordLength ? ' '.repeat(maxKeywordLength + 3) : '  ';
+            endIndent = maxKeywordLength ? ' '.repeat(maxKeywordLength + 1) : '  ';
+        }
+
+        // args配列からWHEN/ELSE句を処理
+        if (expr.args) {
+            for (const arg of expr.args) {
+                if (arg.type === 'when') {
+                    const condition = this.formatExpression(arg.cond, 0, maxKeywordLength);
+                    const result = this.formatExpression(arg.result, 0, maxKeywordLength);
+                    lines.push(`${whenIndent}${this.formatKeyword('WHEN')} ${condition} ${this.formatKeyword('THEN')} ${result}`);
+                } else if (arg.type === 'else') {
+                    const elseResult = this.formatExpression(arg.result, 0, maxKeywordLength);
+                    lines.push(`${whenIndent}${this.formatKeyword('ELSE')} ${elseResult}`);
+                }
             }
         }
-    }
-    
-    return parts;
-}
 
-// INSERT文のフォーマット
-function formatInsertStatement(stmt: any, options: FormatterOptions, parser: Parser, depth: number): string {
-    const insertParts: Array<{keyword: string, content: string}> = [];
-    
-    const insertKeyword = options.keywordCase === 'upper' ? 'INSERT INTO' : 'insert into';
-    let insertContent = stmt.table[0].table;
-    
-    if (stmt.columns) {
-        const columns = stmt.columns.map((col: string) => col).join(', ');
-        insertContent += ` (${columns})`;
+        // ENDインデント
+        lines.push(`${endIndent}${this.formatKeyword('END')}`);
+
+        return lines.join('\n');
     }
-    
-    insertParts.push({keyword: insertKeyword, content: insertContent});
-    
-    const valuesKeyword = options.keywordCase === 'upper' ? 'VALUES' : 'values';
-    let valuesContent = '';
-    
-    if (stmt.values) {
-        const valuesList = stmt.values.map((valueSet: any[]) => {
-            const values = valueSet.map((val: any) => parser.sqlify(val, {})).join(', ');
-            return `(${values})`;
+
+    /**
+     * 二項演算式をフォーマット
+     */
+    private formatBinaryExpression(expr: any, depth: number = 0, maxKeywordLength?: number, contextType?: 'select' | 'where'): string {
+        const left = this.formatExpression(expr.left, depth + 1, maxKeywordLength, undefined, contextType);
+        
+        // CASE文を含む=演算子の特別処理
+        if (expr.operator === '=' && expr.right.type === 'case') {
+            const mexLength = maxKeywordLength ? maxKeywordLength : 2;
+            const operatorPosition = mexLength + left.length + 3; // " = " の長さを考慮
+            const right = this.formatExpression(expr.right, depth + 1, maxKeywordLength, operatorPosition, contextType);
+            return `${left} ${expr.operator} ${right}`;
+        }
+        
+        const right = this.formatExpression(expr.right, depth + 1, maxKeywordLength, undefined, contextType);
+        
+        // AND/OR条件の改行処理
+        if ((expr.operator === 'AND' || expr.operator === 'OR') && depth === 0 && maxKeywordLength) {
+            const conditions = this.flattenAndOrConditions(expr, expr.operator);
+            const formattedConditions = conditions.map((condition, index) => {
+                const conditionStr = this.formatExpression(condition, 1, maxKeywordLength, undefined, contextType);
+                if (index === 0) {
+                    return conditionStr;
+                } else {
+                    const keywordPadding = maxKeywordLength - expr.operator.length;
+                    const paddedKeyword = ' '.repeat(keywordPadding) + expr.operator;
+                    return `${paddedKeyword} ${conditionStr}`;
+                }
+            });
+            return formattedConditions.join('\n');
+        }
+        
+        return `${left} ${expr.operator} ${right}`;
+    }
+
+    /**
+     * AND/OR条件を平坦化
+     */
+    private flattenAndOrConditions(expr: any, operator: string): any[] {
+        if (!expr || expr.type !== 'binary_expr') {
+            return [expr];
+        }
+        
+        if (expr.operator === operator) {
+            return [
+                ...this.flattenAndOrConditions(expr.left, operator),
+                ...this.flattenAndOrConditions(expr.right, operator)
+            ];
+        } else {
+            return [expr];
+        }
+    }
+
+    /**
+     * 集約関数をフォーマット
+     */
+    private formatAggregateFunction(expr: any, depth: number = 0, maxKeywordLength?: number): string {
+        const funcName = expr.name;
+        
+        // 引数の処理
+        if (expr.args && expr.args.expr) {
+            let argStr = '';
+            
+            // DISTINCT句の処理
+            if (expr.args.distinct) {
+                argStr += `${expr.args.distinct} `;
+            }
+            
+            if (expr.args.expr.type === 'star') {
+                argStr += '*';
+            } else {
+                argStr += this.formatExpression(expr.args.expr, depth + 1, maxKeywordLength);
+            }
+            
+            return `${funcName}(${argStr})`;
+        }
+        
+        return `${funcName}()`;
+    }
+
+    /**
+     * ウィンドウ関数をフォーマット
+     */
+    private formatWindowFunction(expr: any, depth: number = 0, maxKeywordLength?: number): string {
+        const funcName = expr.name;
+        
+        // OVER句の処理
+        let result = `${funcName}()`;
+        
+        if (expr.over && expr.over.as_window_specification && expr.over.as_window_specification.window_specification) {
+            const windowSpec = expr.over.as_window_specification.window_specification;
+            const parts: string[] = [];
+            
+            // PARTITION BY句
+            if (windowSpec.partitionby && Array.isArray(windowSpec.partitionby)) {
+                const partitionColumns = windowSpec.partitionby.map((col: any) => {
+                    if (col.expr) {
+                        return this.formatExpression(col.expr, depth + 1, maxKeywordLength);
+                    }
+                    return this.formatExpression(col, depth + 1, maxKeywordLength);
+                }).join(', ');
+                parts.push(`PARTITION BY ${partitionColumns}`);
+            }
+            
+            // ORDER BY句
+            if (windowSpec.orderby && Array.isArray(windowSpec.orderby)) {
+                const orderColumns = windowSpec.orderby.map((col: any) => {
+                    let result = this.formatExpression(col.expr || col, depth + 1, maxKeywordLength);
+                    if (col.type && (col.type === 'ASC' || col.type === 'DESC')) {
+                        result += ` ${col.type}`;
+                    }
+                    return result;
+                }).join(', ');
+                parts.push(`ORDER BY ${orderColumns}`);
+            }
+            
+            if (parts.length > 0) {
+                result = `${funcName}() OVER (${parts.join(' ')})`;
+            } else {
+                result = `${funcName}() OVER ()`;
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * CAST式をフォーマット
+     */
+    private formatCastExpression(expr: any, depth: number = 0, maxKeywordLength?: number): string {
+        const sourceExpr = this.formatExpression(expr.expr, depth + 1, maxKeywordLength);
+        
+        // データ型の処理
+        let dataType = 'UNKNOWN';
+        if (expr.target && Array.isArray(expr.target) && expr.target.length > 0) {
+            dataType = expr.target[0].dataType;
+        }
+        
+        // CAST構文 vs :: 構文の判定
+        if (expr.symbol === '::') {
+            return `${sourceExpr}::${dataType}`;
+        } else {
+            return `CAST(${sourceExpr} AS ${dataType})`;
+        }
+    }
+
+    /**
+     * 単項式をフォーマット (NOT, -, +等)
+     */
+    private formatUnaryExpression(expr: any, depth: number = 0, maxKeywordLength?: number): string {
+        const operand = this.formatExpression(expr.expr, depth + 1, maxKeywordLength);
+        const operator = expr.operator;
+        
+        // 演算子によって前置か後置かを判定
+        if (operator === 'NOT' || operator === '-' || operator === '+') {
+            return `${operator} ${operand}`;
+        } else {
+            return `${operand} ${operator}`;
+        }
+    }
+
+    /**
+     * 配列式をフォーマット
+     */
+    private formatArrayExpression(expr: any, depth: number = 0, maxKeywordLength?: number): string {
+        if (expr.value && Array.isArray(expr.value)) {
+            const elements = expr.value.map((element: any) => this.formatExpression(element, depth + 1, maxKeywordLength)).join(', ');
+            return `ARRAY[${elements}]`;
+        }
+        return 'ARRAY[]';
+    }
+
+    /**
+     * パラメータ式をフォーマット (プリペアドステートメント用)
+     */
+    private formatParameterExpression(expr: any): string {
+        // PostgreSQLの場合は$1, $2, $3... 形式
+        // MySQLの場合は? 形式
+        // 実装では元の値をそのまま返す
+        return expr.value;
+    }
+
+    /**
+     * 関数をフォーマット
+     */
+    private formatFunction(expr: any, depth: number = 0, maxKeywordLength?: number): string {
+        // 関数名の取得
+        let funcName = '';
+        if (typeof expr.name === 'string') {
+            funcName = expr.name;
+        } else if (expr.name && expr.name.name && Array.isArray(expr.name.name)) {
+            funcName = expr.name.name.map((n: any) => n.value || n).join('.');
+        } else if (expr.name && expr.name.value) {
+            funcName = expr.name.value;
+        } else {
+            funcName = 'unknown_function';
+        }
+
+        // 引数の処理
+        if (expr.args && expr.args.value && expr.args.value.length > 0) {
+            const args = expr.args.value.map((arg: any) => this.formatExpression(arg, depth + 1, maxKeywordLength)).join(', ');
+            return `${funcName}(${args})`;
+        } else if (expr.args && Array.isArray(expr.args)) {
+            const args = expr.args.map((arg: any) => this.formatExpression(arg, depth + 1, maxKeywordLength)).join(', ');
+            return `${funcName}(${args})`;
+        }
+        
+        return `${funcName}()`;
+    }
+
+    /**
+     * FROM句をフォーマット
+     */
+    private formatFromClause(fromClause: any[], maxKeywordLength: number): string {
+        const keyword = this.formatKeyword('FROM').padStart(maxKeywordLength, ' ');
+        
+        // JOINが含まれているかチェック
+        const hasJoin = fromClause.some((table, index) => index > 0 && table.join);
+        
+        if (fromClause.length === 1 && !hasJoin) {
+            // 単純なテーブル
+            const table = this.formatTable(fromClause[0]);
+            return `${keyword} ${table}`;
+        }
+
+        // 複雑なFROM句（JOIN含む）の処理
+        return `${keyword} ${this.formatComplexFrom(fromClause, maxKeywordLength)}`;
+    }
+
+    /**
+     * テーブルをフォーマット
+     */
+    private formatTable(table: any): string {
+        let result = table.table;
+        if (table.as) {
+            result += ` AS ${table.as}`;
+        }
+        return result;
+    }
+
+    /**
+     * 複雑なFROM句をフォーマット
+     */
+    private formatComplexFrom(fromClause: any[], maxKeywordLength: number): string {
+        const lines: string[] = [];
+        
+        for (let i = 0; i < fromClause.length; i++) {
+            const table = fromClause[i];
+            
+            if (i === 0) {
+                // 最初のテーブル
+                lines.push(this.formatTable(table));
+            } else if (table.join) {
+                // JOIN処理：実際のJOINタイプを使用し、右揃えを適用
+                const joinKeyword = this.formatKeyword(table.join).padStart(maxKeywordLength, ' ');
+                const tableName = this.formatTable(table);
+                const joinLine = `${joinKeyword} ${tableName}`;
+                
+                if (table.on) {
+                    // JOIN行を追加
+                    lines.push(joinLine);
+                    // ON条件を別行で右揃え
+                    const onLines = this.formatJoinCondition(table.on, maxKeywordLength);
+                    lines.push(...onLines);
+                } else {
+                    lines.push(joinLine);
+                }
+            } else {
+                // 通常のテーブル（カンマ区切り）
+                lines.push(this.formatTable(table));
+            }
+        }
+        
+        // 各行は既に適切にパディングされているため、単純に改行で結合
+        return lines.join('\n');
+    }
+
+    /**
+     * JOIN条件（ON句）をフォーマット
+     */
+    private formatJoinCondition(condition: any, maxKeywordLength: number): string[] {
+        return this.formatJoinConditionRecursive(condition, maxKeywordLength, true);
+    }
+
+    /**
+     * JOIN条件を再帰的にフォーマット
+     */
+    private formatJoinConditionRecursive(condition: any, maxKeywordLength: number, isFirst: boolean): string[] {
+        const lines: string[] = [];
+        
+        if (condition.type === 'binary_expr' && condition.operator === 'AND') {
+            // AND条件の場合、左側を先に処理
+            const leftLines = this.formatJoinConditionRecursive(condition.left, maxKeywordLength, isFirst);
+            lines.push(...leftLines);
+            
+            // 右側をANDキーワードで開始
+            const rightLines = this.formatJoinConditionRecursive(condition.right, maxKeywordLength, false);
+            if (rightLines.length > 0) {
+                // 最初の行にANDキーワードを追加
+                const andKeyword = this.formatKeyword('AND').padStart(maxKeywordLength, ' ');
+                rightLines[0] = `${andKeyword} ${rightLines[0]}`;
+                lines.push(...rightLines);
+            }
+        } else {
+            // 単純な条件の場合
+            const conditionText = this.formatExpression(condition, 0, maxKeywordLength);
+            if (isFirst) {
+                // 最初の条件はONキーワードで開始
+                const onKeyword = this.formatKeyword('ON').padStart(maxKeywordLength, ' ');
+                lines.push(`${onKeyword} ${conditionText}`);
+            } else {
+                // 後続の条件はそのまま（ANDキーワードは呼び出し元で追加される）
+                lines.push(conditionText);
+            }
+        }
+        
+        return lines;
+    }
+
+    /**
+     * WHERE句をフォーマット
+     */
+    private formatWhereClause(whereClause: any, maxKeywordLength: number): string {
+        const keyword = this.formatKeyword('WHERE').padStart(maxKeywordLength, ' ');
+        const condition = this.formatExpression(whereClause, 0, maxKeywordLength, undefined, 'where');
+        return `${keyword} ${condition}`;
+    }
+
+    /**
+     * GROUP BY句をフォーマット
+     */
+    private formatGroupByClause(groupByClause: any, maxKeywordLength: number): string {
+        const keyword = this.formatKeyword('GROUP BY').padStart(maxKeywordLength, ' ');
+        
+        // GROUP BY句が配列でない場合の対応
+        if (!Array.isArray(groupByClause)) {
+            groupByClause = [groupByClause];
+        }
+        
+        const columns = groupByClause.map((col: any) => this.formatExpression(col, 0, maxKeywordLength)).join(', ');
+        return `${keyword} ${columns}`;
+    }
+
+    /**
+     * HAVING句をフォーマット
+     */
+    private formatHavingClause(havingClause: any, maxKeywordLength: number): string {
+        const keyword = this.formatKeyword('HAVING').padStart(maxKeywordLength, ' ');
+        const condition = this.formatExpression(havingClause, 0, maxKeywordLength);
+        return `${keyword} ${condition}`;
+    }
+
+    /**
+     * ORDER BY句をフォーマット
+     */
+    private formatOrderByClause(orderByClause: any[], maxKeywordLength: number): string {
+        const keyword = this.formatKeyword('ORDER BY').padStart(maxKeywordLength, ' ');
+        const columns = orderByClause.map((col: any) => {
+            let result = this.formatExpression(col.expr || col, 0, maxKeywordLength);
+            if (col.type && (col.type === 'ASC' || col.type === 'DESC')) {
+                result += ` ${col.type}`;
+            }
+            return result;
+        }).join(', ');
+        return `${keyword} ${columns}`;
+    }
+
+    /**
+     * LIMIT句をフォーマット
+     */
+    private formatLimitClause(limitClause: any, maxKeywordLength: number): string {
+        const keyword = this.formatKeyword('LIMIT').padStart(maxKeywordLength, ' ');
+        
+        if (limitClause.value && Array.isArray(limitClause.value)) {
+            // LIMIT値を抽出
+            const limitValue = this.formatExpression(limitClause.value[0], 0, maxKeywordLength);
+            
+            // OFFSETがある場合
+            if (limitClause.seperator === 'offset' && limitClause.value.length > 1) {
+                const offsetValue = this.formatExpression(limitClause.value[1], 0, maxKeywordLength);
+                return `${keyword} ${limitValue} OFFSET ${offsetValue}`;
+            } else {
+                return `${keyword} ${limitValue}`;
+            }
+        } else {
+            // フォールバック
+            return `${keyword} ${limitClause}`;
+        }
+    }
+
+    /**
+     * WITH句をフォーマット
+     */
+    private formatWithClause(withClause: any, maxKeywordLength: number): string {
+        if (!withClause || !Array.isArray(withClause)) {
+            return this.formatKeyword('WITH') + ' /* invalid CTE */';
+        }
+
+        const parts: string[] = [];
+        
+        withClause.forEach((cte: any, index: number) => {
+            const cteName = cte.name?.value || cte.name || 'unnamed_cte';
+            const cteQuery = cte.stmt?.ast || cte.stmt;
+            
+            if (index === 0) {
+                // WITHキーワードはレベル0（左端）
+                parts.push(`${this.formatKeyword('WITH')} ${cteName} AS (`);
+            } else {
+                parts.push(`, ${cteName} AS (`);
+            }
+            
+            if (cteQuery) {
+                // CTE内クエリに統一された maxKeywordLength を渡す
+                const formattedQuery = this.formatSelectStatementWithKeywordLength(cteQuery, maxKeywordLength);
+                // 固定インデントを削除：既に統一されたキーワード長で右揃えされているため
+                parts.push(formattedQuery);
+            }
+            
+            parts.push(')');
         });
+
+        return parts.join('\n');
+    }
+
+    /**
+     * INSERT文をフォーマット
+     */
+    private formatInsertStatement(stmt: any): string {
+        const parts: string[] = [];
         
-        if (valuesList.length > 1) {
-            const valuesIndent = ' '.repeat(valuesKeyword.length + 1);
-            valuesContent = '\n' + valuesList.map((values: string, index: number) => {
-                if (index === 0) {
-                    return valuesIndent + '  ' + values;
-                } else {
-                    return valuesIndent + ', ' + values;
-                }
-            }).join('\n');
-        } else {
-            valuesContent = valuesList.join(', ');
-        }
-    }
-    
-    insertParts.push({keyword: valuesKeyword, content: valuesContent});
-    
-    return formatWithRightAlignedKeywords(insertParts, depth * options.indentSize);
-}
-
-// UPDATE文のフォーマット
-function formatUpdateStatement(stmt: any, options: FormatterOptions, parser: Parser, depth: number): string {
-    const updateParts: Array<{keyword: string, content: string}> = [];
-    
-    const updateKeyword = options.keywordCase === 'upper' ? 'UPDATE' : 'update';
-    const updateContent = stmt.table[0].table;
-    updateParts.push({keyword: updateKeyword, content: updateContent});
-    
-    const setKeyword = options.keywordCase === 'upper' ? 'SET' : 'set';
-    let setContent = '';
-    
-    if (stmt.set) {
-        const assignments = stmt.set.map((assignment: any) => 
-            `${assignment.column} = ${parser.sqlify(assignment.value, {})}`
-        );
+        // 最大キーワード長を計算（グローバル統一）
+        const maxKeywordLength = this.calculateGlobalMaxKeywordLength(stmt);
         
-        if (assignments.length > 2) {
-            const setIndent = ' '.repeat(setKeyword.length + 1);
-            setContent = '\n' + assignments.map((assignment: string, index: number) => {
-                if (index === 0) {
-                    return setIndent + '  ' + assignment;
+        // INSERT INTO (右揃え)
+        const tableName = stmt.table?.[0]?.table || 'unknown_table';
+        const insertKeyword = this.formatKeyword('INSERT INTO').padStart(maxKeywordLength, ' ');
+        parts.push(`${insertKeyword} ${tableName}`);
+        
+        // カラムリスト
+        if (stmt.columns) {
+            const columns = stmt.columns.map((col: any) => {
+                if (col.value) {
+                    return col.value;
+                } else if (col.column) {
+                    return col.column;
                 } else {
-                    return setIndent + ', ' + assignment;
+                    return col;
                 }
-            }).join('\n');
-        } else {
-            setContent = assignments.join(', ');
+            }).join(', ');
+            parts.push(`(${columns})`);
         }
+        
+        // VALUES (右揃え)
+        if (stmt.values) {
+            const valuesKeyword = this.formatKeyword('VALUES').padStart(maxKeywordLength, ' ');
+            parts.push(valuesKeyword);
+            
+            // VALUES句の構造に応じて処理
+            if (stmt.values.values && Array.isArray(stmt.values.values)) {
+                const valuesList = stmt.values.values.map((valueSet: any) => {
+                    if (valueSet.value && Array.isArray(valueSet.value)) {
+                        const values = valueSet.value.map((val: any) => this.formatExpression(val, 0)).join(', ');
+                        return `(${values})`;
+                    }
+                    return '(/* unknown values */)';
+                }).join(', ');
+                parts.push(valuesList);
+            } else if (Array.isArray(stmt.values)) {
+                const valuesList = stmt.values.map((valueSet: any) => {
+                    if (valueSet.value && Array.isArray(valueSet.value)) {
+                        const values = valueSet.value.map((val: any) => this.formatExpression(val, 0)).join(', ');
+                        return `(${values})`;
+                    }
+                    return '(/* unknown values */)';
+                }).join(', ');
+                parts.push(valuesList);
+            }
+        }
+        
+        return parts.join(' ');
     }
-    
-    updateParts.push({keyword: setKeyword, content: setContent});
-    
-    if (stmt.where) {
-        const whereKeyword = options.keywordCase === 'upper' ? 'WHERE' : 'where';
-        const whereContent = parser.sqlify(stmt.where, {});
-        updateParts.push({keyword: whereKeyword, content: whereContent});
+
+    /**
+     * UPDATE文をフォーマット
+     */
+    private formatUpdateStatement(stmt: any): string {
+        const parts: string[] = [];
+        
+        // 最大キーワード長を計算（グローバル統一）
+        const maxKeywordLength = this.calculateGlobalMaxKeywordLength(stmt);
+        
+        // UPDATE (右揃え)
+        const tableName = stmt.table?.[0]?.table || 'unknown_table';
+        const updateKeyword = this.formatKeyword('UPDATE').padStart(maxKeywordLength, ' ');
+        parts.push(`${updateKeyword} ${tableName}`);
+        
+        // SET
+        if (stmt.set) {
+            const setKeyword = this.formatKeyword('SET').padStart(maxKeywordLength, ' ');
+            
+            const assignments = stmt.set.map((assignment: any) => {
+                // カラム名を取得
+                let columnName = 'unknown_column';
+                if (assignment.column && assignment.column.expr && assignment.column.expr.value) {
+                    columnName = assignment.column.expr.value;
+                } else if (assignment.column && assignment.column.value) {
+                    columnName = assignment.column.value;
+                } else if (assignment.column) {
+                    columnName = assignment.column;
+                }
+                
+                const value = this.formatExpression(assignment.value, 0);
+                return `${columnName} = ${value}`;
+            });
+            
+            // 単一代入の場合
+            if (assignments.length === 1) {
+                parts.push(`${setKeyword} ${assignments[0]}`);
+            } else {
+                // 複数代入の場合：第一要素はSETキーワードに直接付ける
+                const lines = [`${setKeyword} ${assignments[0]}`];
+                
+                // 残りの代入文（カンマ前置き）
+                // カンマの位置は最大キーワード長から2文字引いた位置
+                const commaIndent = ' '.repeat(Math.max(0, maxKeywordLength - 1));
+                for (let i = 1; i < assignments.length; i++) {
+                    lines.push(`${commaIndent}, ${assignments[i]}`);
+                }
+                
+                parts.push(lines.join('\n'));
+            }
+        }
+        
+        // WHERE
+        if (stmt.where) {
+            parts.push(this.formatWhereClause(stmt.where, maxKeywordLength));
+        }
+        
+        return parts.join('\n');
     }
-    
-    return formatWithRightAlignedKeywords(updateParts, depth * options.indentSize);
+
+    /**
+     * DELETE文をフォーマット
+     */
+    private formatDeleteStatement(stmt: any): string {
+        const parts: string[] = [];
+        
+        // 最大キーワード長を計算（グローバル統一）
+        const maxKeywordLength = this.calculateGlobalMaxKeywordLength(stmt);
+        
+        // DELETE FROM (右揃え)
+        const tableName = stmt.from?.[0]?.table || 'unknown_table';
+        const deleteKeyword = this.formatKeyword('DELETE FROM').padStart(maxKeywordLength, ' ');
+        parts.push(`${deleteKeyword} ${tableName}`);
+        
+        // WHERE
+        if (stmt.where) {
+            parts.push(this.formatWhereClause(stmt.where, maxKeywordLength));
+        }
+        
+        return parts.join('\n');
+    }
+
+    /**
+     * REPLACE文をフォーマット
+     */
+    private formatReplaceStatement(stmt: any): string {
+        const parts: string[] = [];
+        
+        // REPLACE INTO
+        const tableName = stmt.table?.[0]?.table || 'unknown_table';
+        parts.push(`${this.formatKeyword('REPLACE INTO')} ${tableName}`);
+        
+        // カラムリスト
+        if (stmt.columns) {
+            const columns = stmt.columns.map((col: any) => {
+                if (col.value) {
+                    return col.value;
+                } else if (col.column) {
+                    return col.column;
+                } else {
+                    return col;
+                }
+            }).join(', ');
+            parts.push(`(${columns})`);
+        }
+        
+        // VALUES
+        if (stmt.values) {
+            parts.push(this.formatKeyword('VALUES'));
+            
+            // VALUES句の構造に応じて処理
+            if (stmt.values.values && Array.isArray(stmt.values.values)) {
+                const valuesList = stmt.values.values.map((valueSet: any) => {
+                    if (valueSet.value && Array.isArray(valueSet.value)) {
+                        const values = valueSet.value.map((val: any) => this.formatExpression(val, 0)).join(', ');
+                        return `(${values})`;
+                    }
+                    return '(/* unknown values */)';
+                }).join(', ');
+                parts.push(valuesList);
+            } else if (Array.isArray(stmt.values)) {
+                const valuesList = stmt.values.map((valueSet: any) => {
+                    if (valueSet.value && Array.isArray(valueSet.value)) {
+                        const values = valueSet.value.map((val: any) => this.formatExpression(val, 0)).join(', ');
+                        return `(${values})`;
+                    }
+                    return '(/* unknown values */)';
+                }).join(', ');
+                parts.push(valuesList);
+            }
+        }
+        
+        return parts.join(' ');
+    }
+
+    /**
+     * CREATE文をフォーマット
+     */
+    private formatCreateStatement(stmt: any): string {
+        const parts: string[] = [];
+        
+        // CREATE [TEMPORARY] keyword
+        let createKeyword = this.formatKeyword('CREATE');
+        if (stmt.temporary) {
+            createKeyword += ` ${this.formatKeyword('TEMPORARY')}`;
+        }
+        createKeyword += ` ${this.formatKeyword(stmt.keyword?.toUpperCase() || 'TABLE')}`;
+        
+        // IF NOT EXISTS
+        if (stmt.if_not_exists) {
+            createKeyword += ` ${this.formatKeyword('IF NOT EXISTS')}`;
+        }
+        
+        // テーブル名/オブジェクト名
+        let objectName = 'unknown_object';
+        if (stmt.table) {
+            if (Array.isArray(stmt.table)) {
+                objectName = stmt.table.map((t: any) => t.table || t).join(', ');
+            } else if (stmt.table.table) {
+                objectName = stmt.table.table;
+            } else {
+                objectName = stmt.table;
+            }
+        } else if (stmt.index && typeof stmt.index === 'string') {
+            objectName = stmt.index;
+        } else if (stmt.index && stmt.index.name) {
+            objectName = stmt.index.name;
+        }
+        
+        parts.push(`${createKeyword} ${objectName}`);
+        
+        // カラム定義など（簡略化）
+        if (stmt.create_definitions && Array.isArray(stmt.create_definitions)) {
+            parts.push('(');
+            parts.push('  /* column definitions */');
+            parts.push(')');
+        }
+        
+        return parts.join('\n');
+    }
+
+    /**
+     * DROP文をフォーマット
+     */
+    private formatDropStatement(stmt: any): string {
+        const parts: string[] = [];
+        
+        // DROP keyword
+        let dropKeyword = this.formatKeyword('DROP');
+        if (stmt.keyword) {
+            dropKeyword += ` ${this.formatKeyword(stmt.keyword.toUpperCase())}`;
+        }
+        
+        // オブジェクト名
+        let objectNames = 'unknown_object';
+        if (stmt.name && Array.isArray(stmt.name)) {
+            objectNames = stmt.name.map((n: any) => {
+                if (typeof n === 'string') {
+                    return n;
+                } else if (n.table) {
+                    return n.table;
+                } else {
+                    return String(n);
+                }
+            }).join(', ');
+        }
+        
+        parts.push(`${dropKeyword} ${objectNames}`);
+        
+        return parts.join(' ');
+    }
+
+    /**
+     * ALTER文をフォーマット
+     */
+    private formatAlterStatement(stmt: any): string {
+        const parts: string[] = [];
+        
+        // ALTER TABLE
+        parts.push(this.formatKeyword('ALTER TABLE'));
+        
+        // テーブル名
+        let tableName = 'unknown_table';
+        if (stmt.table && Array.isArray(stmt.table) && stmt.table.length > 0) {
+            tableName = stmt.table[0].table || 'unknown_table';
+        }
+        parts.push(tableName);
+        
+        // ALTER操作（簡略化）
+        if (stmt.expr) {
+            parts.push('/* alter operations */');
+        }
+        
+        return parts.join(' ');
+    }
+
+    /**
+     * TRUNCATE文をフォーマット
+     */
+    private formatTruncateStatement(stmt: any): string {
+        const parts: string[] = [];
+        
+        // TRUNCATE [TABLE]
+        let truncateKeyword = this.formatKeyword('TRUNCATE');
+        if (stmt.keyword) {
+            truncateKeyword += ` ${this.formatKeyword(stmt.keyword.toUpperCase())}`;
+        }
+        
+        // テーブル名
+        let tableNames = 'unknown_table';
+        if (stmt.name && Array.isArray(stmt.name)) {
+            tableNames = stmt.name.map((n: any) => {
+                if (typeof n === 'string') {
+                    return n;
+                } else if (n.table) {
+                    return n.table;
+                } else {
+                    return String(n);
+                }
+            }).join(', ');
+        }
+        
+        parts.push(`${truncateKeyword} ${tableNames}`);
+        
+        return parts.join(' ');
+    }
+
+    /**
+     * SHOW文をフォーマット
+     */
+    private formatShowStatement(stmt: any): string {
+        const parts: string[] = [];
+        
+        // SHOW keyword
+        parts.push(this.formatKeyword('SHOW'));
+        
+        // SHOW対象（簡略化）
+        if (stmt.keyword) {
+            parts.push(this.formatKeyword(stmt.keyword.toUpperCase()));
+        } else {
+            parts.push('/* show target */');
+        }
+        
+        return parts.join(' ');
+    }
+
+
+    /**
+     * キーワードをフォーマット（大文字/小文字）
+     */
+    private formatKeyword(keyword: string): string {
+        return this.options.keywordCase === 'upper' ? keyword.toUpperCase() : keyword.toLowerCase();
+    }
 }
 
-// DELETE文のフォーマット
-function formatDeleteStatement(stmt: any, options: FormatterOptions, parser: Parser, depth: number): string {
-    const deleteParts: Array<{keyword: string, content: string}> = [];
-    
-    const deleteKeyword = options.keywordCase === 'upper' ? 'DELETE FROM' : 'delete from';
-    const deleteContent = stmt.from[0].table;
-    deleteParts.push({keyword: deleteKeyword, content: deleteContent});
-    
-    if (stmt.where) {
-        const whereKeyword = options.keywordCase === 'upper' ? 'WHERE' : 'where';
-        const whereContent = parser.sqlify(stmt.where, {});
-        deleteParts.push({keyword: whereKeyword, content: whereContent});
-    }
-    
-    return formatWithRightAlignedKeywords(deleteParts, depth * options.indentSize);
-}
-
-// テーブル参照のフォーマット
-function formatTableReference(table: any, options: FormatterOptions): string {
-    let result = table.table;
-    if (table.as) {
-        const asKeyword = options.keywordCase === 'upper' ? 'AS' : 'as';
-        result += ` ${asKeyword} ${table.as}`;
-    }
-    return result;
+/**
+ * 公開API
+ */
+export function formatSql(sql: string, options: FormatterOptions = {}): string {
+    const formatter = new SqlFormatter(options);
+    return formatter.formatSql(sql);
 }

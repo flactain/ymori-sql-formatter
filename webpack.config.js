@@ -45,4 +45,34 @@ const extensionConfig = {
     level: "log", // enables logging required for problem matchers
   },
 };
-module.exports = [ extensionConfig ];
+
+/** @type WebpackConfig */
+const formatterConfig = {
+  target: 'node',
+  mode: 'none',
+  entry: './src/formatter.ts',
+  output: {
+    path: path.resolve(__dirname, 'dist'),
+    filename: 'formatter.js',
+    libraryTarget: 'commonjs2'
+  },
+  resolve: {
+    extensions: ['.ts', '.js']
+  },
+  module: {
+    rules: [
+      {
+        test: /\.ts$/,
+        exclude: /node_modules/,
+        use: [
+          {
+            loader: 'ts-loader'
+          }
+        ]
+      }
+    ]
+  },
+  devtool: 'nosources-source-map',
+};
+
+module.exports = [ extensionConfig, formatterConfig ];

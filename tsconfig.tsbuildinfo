@@ -1,0 +1,1 @@
+{"root":["./src/debug-columns.ts","./src/debug-parser.ts","./src/debug-simple.ts","./src/extension.ts","./src/formatter.ts","./src/test-runner.ts","./src/test/extension.test.ts","./src/test/formatter.test.ts"],"version":"5.9.2"}
