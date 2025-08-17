@@ -82,3 +82,20 @@ with /* emplyeeMapper.fetch */ emp as (select * from employees) select name from
 
 -- 24. LEFT JOIN
 with quarterly_sales as (select extract(quarter from order_date) as quarter, extract(year from order_date) as year, user_id, sum(total) as total_sales, count(*) as order_count from orders where order_date >= current_date - interval '2 years' group by extract(quarter from order_date), extract(year from order_date), user_id), user_metrics as (select u.id, u.name, u.email, u.department_id, coalesce(qs.total_sales, 0) as total_sales, coalesce(qs.order_count, 0) as order_count, rank() over (partition by u.department_id order by coalesce(qs.total_sales, 0) desc) as dept_rank from users u left join quarterly_sales qs on u.id = qs.user_id where u.status = 'active'), department_summary as (select d.name as dept_name, count(um.id) as active_users, avg(um.total_sales) as avg_sales, sum(um.total_sales) as dept_total_sales from departments d left join user_metrics um on d.id = um.department_id group by d.id, d.name having count(um.id) > 3) select ds.dept_name, ds.active_users, round(ds.avg_sales, 2) as avg_sales, ds.dept_total_sales, um.name as top_performer, um.total_sales as top_sales from department_summary ds left join user_metrics um on ds.dept_name = (select name from departments where id = um.department_id) where um.dept_rank = 1 order by ds.dept_total_sales desc, ds.avg_sales desc;
+
+
+-- 25 FROM subquery
+SELECT
+       user_name
+     , total_orders
+  FROM (   SELECT
+                  name     AS user_name
+                , COUNT(*) AS total_orders
+             FROM users AS u
+       INNER JOIN orders AS o
+               ON u.id = o.user_id
+         GROUP BY name
+       ) AS user_stats
+;
+
+-- 26 tuple

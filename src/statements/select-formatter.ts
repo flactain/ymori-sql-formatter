@@ -20,15 +20,17 @@ export class SelectFormatter {
   /**
    * SELECT文をフォーマット（新しいIndentContext対応版）
    */
-  formatSelectStatementWithContext(stmt: any, context: IndentContext): string {
+  formatSelectStatementWithContext(stmt: any, context: IndentContext, useStandardFormat: boolean = false): string {
     const parts: string[] = [];
 
-    // メインクエリ（nestLevel=0）またはCTEルートレベルの場合のみ、CTE+メインクエリ全体でのキーワード長を再計算
+    // メインクエリでWITH句がある場合のみ、CTE+メインクエリ全体でのキーワード長を再計算
     let actualContext = context;
     if (
-      context.nestLevel === 0 ||
-      (context.contextType === "main" && stmt.with)
+      context.nestLevel === 0 &&
+      context.contextType === "main" &&
+      stmt.with
     ) {
+      // WITH句がある場合は全体の統一キーワード長を計算
       const globalMaxKeywordLength =
         FormatterUtils.calculateGlobalMaxKeywordLength(stmt);
       actualContext = new IndentContext(
@@ -37,19 +39,22 @@ export class SelectFormatter {
         globalMaxKeywordLength,
         context.parent
       );
+    } else {
+      // CTE内クエリなど、既に適切なキーワード長が設定されている場合はそのまま使用
+      actualContext = context;
     }
 
     // WITH句の処理（ネストしたCTEの場合）
     if (stmt.with) {
-      parts.push(this.formatWithClauseWithContext(stmt.with, actualContext));
+      parts.push(this.formatWithClauseWithContext(stmt.with, actualContext, useStandardFormat));
     }
 
     // SELECT句
-    parts.push(this.formatSelectClauseWithContext(stmt, actualContext));
+    parts.push(this.formatSelectClauseWithContext(stmt, actualContext, useStandardFormat));
 
     // FROM句
     if (stmt.from) {
-      parts.push(this.formatFromClauseWithContext(stmt.from, actualContext));
+      parts.push(this.formatFromClauseWithContext(stmt.from, actualContext, useStandardFormat));
     }
 
     // WHERE句
@@ -90,7 +95,7 @@ export class SelectFormatter {
       ).padStart(actualContext.baseKeywordLength, " ");
       parts.push(setOpKeyword);
       parts.push(
-        this.formatSelectStatementWithContext(stmt._next, actualContext)
+        this.formatSelectStatementWithContext(stmt._next, actualContext, useStandardFormat)
       );
     }
 
@@ -102,7 +107,8 @@ export class SelectFormatter {
    */
   private formatWithClauseWithContext(
     withClause: any,
-    context: IndentContext
+    context: IndentContext,
+    useStandardFormat: boolean = false
   ): string {
     if (!withClause || !Array.isArray(withClause)) {
       return this.formatKeyword("WITH") + " /* invalid CTE */";
@@ -115,21 +121,34 @@ export class SelectFormatter {
       const cteQuery = cte.stmt?.ast || cte.stmt;
 
       if (index === 0) {
-        // WITHキーワードは基準位置
-        parts.push(`${this.formatKeyword("WITH")} ${cteName} AS (`);
+        // WITHキーワードも右揃えする
+        const withKeyword = "WITH";
+        parts.push(`${withKeyword} ${cteName} AS (`);
       } else {
-        parts.push(`, ${cteName} AS (`);
+        // 2番目以降のCTEもインデントを統一
+        const commaIndent = " ".repeat(
+          Math.max(0, context.baseKeywordLength - 2)
+        );
+        parts.push(`,    ${cteName} AS (`);
       }
 
       if (cteQuery) {
         // CTE内クエリは現在のコンテキストと同じキーワード長でフォーマット（CTE+メインクエリ統一）
+        // CTE専用のコンテキストを作成（統一キーワード長を保持）
+        const cteContext = new IndentContext(
+          0, // CTE内もルートレベル扱い
+          "main", // メインクエリタイプ
+          context.baseKeywordLength, // 統一されたキーワード長を引き継ぎ
+          context.parent,
+          false // CTEは常にコンパクト形式
+        );
         const formattedQuery = this.formatSelectStatementWithContext(
           cteQuery,
-          context
+          cteContext,
+          useStandardFormat
         );
-        parts.push(formattedQuery);
+        parts.push(`${formattedQuery}`);
       }
-
       parts.push(")");
     });
 
@@ -141,7 +160,8 @@ export class SelectFormatter {
    */
   private formatSelectClauseWithContext(
     stmt: any,
-    context: IndentContext
+    context: IndentContext,
+    useStandardFormat: boolean = false
   ): string {
     const keyword = this.formatKeyword("SELECT");
 
@@ -154,31 +174,56 @@ export class SelectFormatter {
 
     // カラムをフォーマット（SELECT句のコンテキストで）
     const selectContext = context.createSiblingContext("select_clause");
-    const formattedColumns = stmt.columns.map((col: any) =>
-      this.formatColumnWithContext(col, selectContext)
+    const formattedColumns = this.formatColumnsWithAliasAlignment(
+      stmt.columns,
+      selectContext
     );
 
     // 結果
     const lines = [];
 
-    // 単一カラムの場合
+    // 単一カラムの場合もuseStandardFormatを考慮
     if (formattedColumns.length === 1) {
-      return `${selectKeyword} ${formattedColumns[0]}`;
-    } else {
-      // 複数カラムの場合は左揃え形式
-      lines.push(selectKeyword);
+      if (useStandardFormat) {
+        // 標準形式：SELECT + 改行 + カラム
+        const columnIndent = " ".repeat(context.baseKeywordLength + 1);
+        return `${selectKeyword}\n${columnIndent}${formattedColumns[0]}`;
+      } else {
+        // コンパクト形式：SELECT カラム（同一行）
+        return `${selectKeyword} ${formattedColumns[0]}`;
+      }
     }
-
-    // カラムの開始位置を動的に計算
-    const columnIndent = " ".repeat(context.baseKeywordLength + 1);
-
-    // 最初のカラム
-    lines.push(`${columnIndent}${formattedColumns[0]}`);
-
-    // 残りのカラム（カンマ前置き）
-    const commaIndent = " ".repeat(Math.max(0, context.baseKeywordLength - 1));
-    for (let i = 1; i < formattedColumns.length; i++) {
-      lines.push(`${commaIndent}, ${formattedColumns[i]}`);
+    
+    // 複数カラムの場合：改行制御
+    // useStandardFormat = true (SELECTで始まる) → 標準形式（改行あり）
+    // useStandardFormat = false (WITHで始まる) → コンパクト形式（改行なし）
+    const shouldUseCompactFormat = !useStandardFormat;
+    
+    if (shouldUseCompactFormat) {
+      // コンパクト形式：SELECTキーワードと最初のカラムを同じ行に
+      const firstLine = `${selectKeyword} ${formattedColumns[0]}`;
+      lines.push(firstLine);
+      
+      // 残りのカラム（カンマ前置き）
+      const commaIndent = " ".repeat(Math.max(0, context.baseKeywordLength - 1));
+      for (let i = 1; i < formattedColumns.length; i++) {
+        lines.push(`${commaIndent}, ${formattedColumns[i]}`);
+      }
+    } else {
+      // 標準形式：SELECTキーワード後に改行
+      lines.push(selectKeyword);
+      
+      // カラムの開始位置を動的に計算
+      const columnIndent = " ".repeat(context.baseKeywordLength + 1);
+      
+      // 最初のカラム
+      lines.push(`${columnIndent}${formattedColumns[0]}`);
+      
+      // 残りのカラム（カンマ前置き）
+      const commaIndent = " ".repeat(Math.max(0, context.baseKeywordLength - 1));
+      for (let i = 1; i < formattedColumns.length; i++) {
+        lines.push(`${commaIndent}, ${formattedColumns[i]}`);
+      }
     }
 
     return lines.join("\n");
@@ -189,7 +234,8 @@ export class SelectFormatter {
    */
   private formatFromClauseWithContext(
     fromClause: any[],
-    context: IndentContext
+    context: IndentContext,
+    useStandardFormat: boolean = false
   ): string {
     const keyword = this.formatKeyword("FROM").padStart(
       context.baseKeywordLength,
@@ -201,14 +247,15 @@ export class SelectFormatter {
 
     if (fromClause.length === 1 && !hasJoin) {
       // 単純なテーブル
-      const table = this.formatTableWithContext(fromClause[0], context);
+      const table = this.formatTableWithContext(fromClause[0], context, useStandardFormat);
       return `${keyword} ${table}`;
     }
 
     // 複雑なFROM句（JOIN含む）の処理
     return `${keyword} ${this.formatComplexFromWithContext(
       fromClause,
-      context
+      context,
+      useStandardFormat
     )}`;
   }
 
@@ -337,6 +384,59 @@ export class SelectFormatter {
   }
 
   // プライベートメソッド群
+  private formatColumnsWithAliasAlignment(
+    columns: any[],
+    context: IndentContext
+  ): string[] {
+    // 1. 各カラムの式部分とエイリアス部分を分離してフォーマット
+    const columnData = columns.map((col) => {
+      const expressionPart = this.formatColumnExpression(col, context);
+      const aliasPart = col.as ? col.as : null;
+      return { expressionPart, aliasPart, originalColumn: col };
+    });
+
+    // 2. 最大の式部分の長さを計算（AS句がある場合のみ）
+    const hasAnyAlias = columnData.some((data) => data.aliasPart !== null);
+
+    if (!hasAnyAlias) {
+      // AS句がない場合は従来通り
+      return columnData.map((data) => data.expressionPart);
+    }
+
+    const maxExpressionLength = Math.max(
+      ...columnData.map((data) => data.expressionPart.length)
+    );
+
+    // 3. AS句を統一位置に揃えてフォーマット
+    return columnData.map((data) => {
+      if (data.aliasPart) {
+        const padding = " ".repeat(
+          maxExpressionLength - data.expressionPart.length
+        );
+        return `${data.expressionPart}${padding} AS ${data.aliasPart}`;
+      } else {
+        return data.expressionPart;
+      }
+    });
+  }
+
+  private formatColumnExpression(col: any, context: IndentContext): string {
+    // カラム式部分のみをフォーマット（AS句は含まない）
+    if (col.type === "expr" && col.expr) {
+      return this.expressionFormatter.formatExpressionWithContext(
+        col.expr,
+        context
+      );
+    } else if (col.expr) {
+      return this.expressionFormatter.formatExpressionWithContext(
+        col.expr,
+        context
+      );
+    } else {
+      return this.expressionFormatter.formatExpressionWithContext(col, context);
+    }
+  }
+
   private formatColumnWithContext(col: any, context: IndentContext): string {
     let result = "";
     // カラムの型に応じて処理
@@ -365,17 +465,75 @@ export class SelectFormatter {
     return result;
   }
 
-  private formatTableWithContext(table: any, _context: IndentContext): string {
-    let result = table.table;
-    if (table.as) {
-      result += ` AS ${table.as}`;
+  private formatTableWithContext(table: any, context: IndentContext, useStandardFormat: boolean = false): string {
+    let result = "";
+
+    try {
+      // サブクエリの場合 (table.expr.ast が存在)
+      if (table.expr && table.expr.ast) {
+        // FROM句内のサブクエリをフォーマット - 動的にキーワード長を計算
+        const subqueryKeywordLength =
+          this.calculateSubqueryKeywordLength(table.expr.ast) <= 6
+            ? 8
+            : this.calculateSubqueryKeywordLength(table.expr.ast);
+        const subqueryContext = new IndentContext(
+          context.nestLevel + 1,
+          'subquery',
+          subqueryKeywordLength,
+          context,
+          false // サブクエリは常にコンパクト形式
+        );
+        const formattedSubquery = this.formatSelectStatementWithContext(
+          table.expr.ast,
+          subqueryContext,
+          useStandardFormat
+        );
+        const baseIndent = " ".repeat(context.baseKeywordLength + 1);
+        const indentedSubquery = formattedSubquery
+          .split("\n")
+          .map((line, index) => {
+            if (index === 0 && line.trim() === "SELECT") {
+              return line.trim()
+                ? `${" ".repeat(
+                    subqueryKeywordLength - context.baseKeywordLength - 2
+                  )}${line.trim()}`
+                : line;
+            } else {
+              return line.trim() ? `${baseIndent}${line}` : line;
+            }
+          })
+          .join("\n");
+        result = `( ${indentedSubquery}\n${baseIndent})`;
+      }
+      // 通常のテーブルの場合
+      else if (table.table) {
+        result = table.table;
+      }
+      // 予期しない構造の場合のフォールバック
+      else {
+        console.warn("Unexpected table structure:", table);
+        result = table.name || table.value || "unknown_table";
+      }
+
+      // AS句の処理
+      if (table.as) {
+        result += ` AS ${table.as}`;
+      }
+
+      return result;
+    } catch (error) {
+      // エラーハンドリング：元の情報を保持
+      console.error("Error formatting table:", error, table);
+      const fallbackName =
+        table.table || table.name || table.as || "error_table";
+      return table.as ? `${fallbackName} AS ${table.as}` : fallbackName;
     }
-    return result;
   }
 
   private formatComplexFromWithContext(
     fromClause: any[],
-    context: IndentContext
+    context: IndentContext,
+    useStandardFormat: boolean = false
   ): string {
     const lines: string[] = [];
 
@@ -384,14 +542,14 @@ export class SelectFormatter {
 
       if (i === 0) {
         // 最初のテーブル
-        lines.push(this.formatTableWithContext(table, context));
+        lines.push(this.formatTableWithContext(table, context, useStandardFormat));
       } else if (table.join) {
         // JOIN処理：実際のJOINタイプを使用し、右揃えを適用
         const joinKeyword = this.formatKeyword(table.join).padStart(
           context.baseKeywordLength,
           " "
         );
-        const tableName = this.formatTableWithContext(table, context);
+        const tableName = this.formatTableWithContext(table, context, useStandardFormat);
         const joinLine = `${joinKeyword} ${tableName}`;
 
         if (table.on) {
@@ -410,7 +568,7 @@ export class SelectFormatter {
         }
       } else {
         // 通常のテーブル（カンマ区切り）
-        lines.push(this.formatTableWithContext(table, context));
+        lines.push(this.formatTableWithContext(table, context, useStandardFormat));
       }
     }
 
@@ -490,5 +648,13 @@ export class SelectFormatter {
     return this.options.keywordCase === "upper"
       ? keyword.toUpperCase()
       : keyword.toLowerCase();
+  }
+
+  /**
+   * サブクエリのキーワード長を計算
+   */
+  private calculateSubqueryKeywordLength(ast: any): number {
+    const keywords = FormatterUtils.collectKeywordsFromStatement(ast);
+    return keywords.length > 0 ? Math.max(...keywords.map((k) => k.length)) : 6;
   }
 }

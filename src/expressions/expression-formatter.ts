@@ -425,10 +425,16 @@ export class ExpressionFormatter {
         
         // サブクエリ用のコンテキストを動的なキーワード長で再作成
         const parentContext = subqueryContext.parent || subqueryContext;
-        const dynamicSubqueryContext = parentContext.createSubqueryContext(subqueryKeywordLength);
+        const dynamicSubqueryContext = new IndentContext(
+            parentContext.nestLevel + 1,
+            'subquery',
+            subqueryKeywordLength,
+            parentContext,
+            false // サブクエリは常にコンパクト形式
+        );
         
         // サブクエリ内容をフォーマット（動的コンテキストを使用）
-        const subqueryResult = this.selectFormatter.formatSelectStatementWithContext(ast, dynamicSubqueryContext);
+        const subqueryResult = this.selectFormatter.formatSelectStatementWithContext(ast, dynamicSubqueryContext, false);
         
         // WHERE句とSELECT句で異なるインデント処理
         if (isWhereContext) {
@@ -778,7 +784,7 @@ export class ExpressionFormatter {
      * SELECT文をフォーマット
      */
     private formatSelectStatementWithContext(ast: any, context: IndentContext): string {
-        return this.selectFormatter.formatSelectStatementWithContext(ast, context);
+        return this.selectFormatter.formatSelectStatementWithContext(ast, context, false);
     }
 
     /**

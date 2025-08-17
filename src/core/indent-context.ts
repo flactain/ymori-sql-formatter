@@ -12,13 +12,16 @@ export type IndentContextType =
 export interface FormatterOptions {
     indentSize?: number;
     keywordCase?: 'upper' | 'lower';
+    insertDummyHint?: boolean;
 }
 
 // デフォルトオプション
 export const DEFAULT_FORMATTER_OPTIONS: Required<FormatterOptions> = {
     indentSize: 2,
-    keywordCase: 'upper'
+    keywordCase: 'upper',
+    insertDummyHint: true
 };
+
 
 // インデントコンテキスト管理クラス
 export class IndentContext {
@@ -26,17 +29,20 @@ export class IndentContext {
     public readonly contextType: IndentContextType;
     public readonly baseKeywordLength: number;
     public readonly parent: IndentContext | null;
+    public readonly isFirstSelect: boolean;
     
     constructor(
         nestLevel: number = 0,
         contextType: IndentContextType = 'main',
         baseKeywordLength: number = 0,
-        parent: IndentContext | null = null
+        parent: IndentContext | null = null,
+        isFirstSelect: boolean = false
     ) {
         this.nestLevel = nestLevel;
         this.contextType = contextType;
         this.baseKeywordLength = baseKeywordLength;
         this.parent = parent;
+        this.isFirstSelect = isFirstSelect;
     }
 
     // 子コンテキストを作成
@@ -45,7 +51,8 @@ export class IndentContext {
             this.nestLevel + 1,
             childType,
             this.baseKeywordLength,
-            this
+            this,
+            false // 子コンテキストは最初のSELECTではない
         );
     }
 
@@ -55,7 +62,8 @@ export class IndentContext {
             this.nestLevel,
             siblingType,
             this.baseKeywordLength,
-            this.parent
+            this.parent,
+            false // 兄弟コンテキストは最初のSELECTではない
         );
     }
 
@@ -69,7 +77,8 @@ export class IndentContext {
             newNestLevel,
             'subquery',
             subqueryBaseLength,
-            this
+            this,
+            false // サブクエリは最初のSELECTではない
         );
     }
 

@@ -26,8 +26,12 @@ export class SqlFormatter {
      */
     formatSql(sql: string): string {
         try {
-            // ヒント句を抽出・保存
-            const { sql: cleanSql, hint } = FormatterUtils.extractHintComment(sql);
+            // ヒント句を抽出・保存（ダミーヒント句オプション対応）
+            const { sql: cleanSql, hint } = FormatterUtils.extractHintComment(sql, this.options.insertDummyHint);
+            
+            // クエリ全体がSELECTで始まるかどうかを判定
+            const trimmedSql = cleanSql.trim().toUpperCase();
+            const queryStartsWithSelect = trimmedSql.startsWith('SELECT');
             
             // PostgreSQL用でパース
             const ast = this.parser.astify(cleanSql, { database: 'Postgresql' });
@@ -40,7 +44,7 @@ export class SqlFormatter {
             }
 
             // 各文をフォーマット
-            const formattedStatements = statements.map(stmt => this.formatStatement(stmt));
+            const formattedStatements = statements.map(stmt => this.formatStatement(stmt, queryStartsWithSelect));
             let result = formattedStatements.join('\n\n');
 
             // ヒント句を復元
@@ -65,43 +69,60 @@ export class SqlFormatter {
     /**
      * 文をフォーマット
      */
-    private formatStatement(stmt: any): string {
-        switch (stmt.type) {
-            case 'select':
-                return this.formatSelectStatement(stmt);
-            case 'insert':
-                return this.formatInsertStatement(stmt);
-            case 'replace':
-                return this.formatReplaceStatement(stmt);
-            case 'update':
-                return this.formatUpdateStatement(stmt);
-            case 'delete':
-                return this.formatDeleteStatement(stmt);
-            case 'create':
-                return this.formatCreateStatement(stmt);
-            case 'drop':
-                return this.formatDropStatement(stmt);
-            case 'alter':
-                return this.formatAlterStatement(stmt);
-            case 'truncate':
-                return this.formatTruncateStatement(stmt);
-            case 'show':
-                return this.formatShowStatement(stmt);
-            default:
-                throw new Error(`Unsupported statement type: ${stmt.type}`);
+    private formatStatement(stmt: any, queryStartsWithSelect: boolean = false): string {
+        try {
+            if (!stmt || !stmt.type) {
+                console.warn('Invalid statement structure:', stmt);
+                return '/* invalid statement */';
+            }
+
+            switch (stmt.type) {
+                case 'select':
+                    return this.formatSelectStatement(stmt, queryStartsWithSelect);
+                case 'insert':
+                    return this.formatInsertStatement(stmt);
+                case 'replace':
+                    return this.formatReplaceStatement(stmt);
+                case 'update':
+                    return this.formatUpdateStatement(stmt);
+                case 'delete':
+                    return this.formatDeleteStatement(stmt);
+                case 'create':
+                    return this.formatCreateStatement(stmt);
+                case 'drop':
+                    return this.formatDropStatement(stmt);
+                case 'alter':
+                    return this.formatAlterStatement(stmt);
+                case 'truncate':
+                    return this.formatTruncateStatement(stmt);
+                case 'show':
+                    return this.formatShowStatement(stmt);
+                default:
+                    console.warn(`Unsupported statement type: ${stmt.type}`);
+                    return `/* unsupported statement type: ${stmt.type} */`;
+            }
+        } catch (error) {
+            console.error('Error formatting statement:', error, stmt);
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            return `/* error formatting statement: ${errorMessage} */`;
         }
     }
 
     /**
      * SELECT文をフォーマット
      */
-    private formatSelectStatement(stmt: any): string {
+    private formatSelectStatement(stmt: any, queryStartsWithSelect: boolean = false): string {
         // 最大キーワード長を計算（CTE+メインクエリ全体）
         const maxKeywordLength = FormatterUtils.calculateGlobalMaxKeywordLength(stmt);
         
-        // 新しいIndentContextシステムを使用
-        const rootContext = new IndentContext(0, 'main', maxKeywordLength, null);
-        return this.selectFormatter.formatSelectStatementWithContext(stmt, rootContext);
+        // フォーマット制御：SELECTで始まる場合のみ改行あり（標準形式）
+        const useStandardFormat = queryStartsWithSelect;
+        
+        // ルートコンテキストを作成
+        const rootContext = new IndentContext(0, 'main', maxKeywordLength, null, false);
+        const result = this.selectFormatter.formatSelectStatementWithContext(stmt, rootContext, useStandardFormat);
+        
+        return result;
     }
 
     // 他の文のフォーマット（プレースホルダー）
