@@ -4,3 +4,22 @@ node_modules
 .vscode-test/
 *.vsix
 .env
+
+# TypeScript build artifacts
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# Development test files
+test_*.js
+debug_*.js
+*_test.js
+*_debug.js
+
+# Development documentation
+*_SUMMARY.md
+ast_coverage_analysis.md
+
+# Temporary files
+*.tmp
+*.temp
+old/
